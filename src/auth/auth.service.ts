@@ -1,4 +1,4 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 
@@ -9,7 +9,7 @@ export class AuthService {
   getAuthUrl(): string {
     const appId = this.configService.get<string>('APP_ID');
     const redirectUri = this.configService.get<string>('REDIRECT_URI');
-    const scopes = 'read write offline'; // Ajusta según sea necesario
+    const scopes = 'read write offline_access'; // Ajusta según sea necesario
     return `https://auth.mercadolibre.cl/authorization?response_type=code&client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}`;
   }
 
@@ -18,38 +18,44 @@ export class AuthService {
     const clientSecret = this.configService.get<string>('CLIENT_SECRET');
     const redirectUri = this.configService.get<string>('REDIRECT_URI');
 
-
     try {
       const response = await axios.post(
         'https://api.mercadolibre.com/oauth/token',
-        null,
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri,
+        }).toString(),
         {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          params: {
-            grant_type: 'authorization_code',
-            code,
-            client_id: clientId,
-            client_secret: clientSecret,
-            redirect_uri: redirectUri,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
           },
         },
       );
 
-      return response.data;
+      return response.data; // Asegúrate de que esto devuelva el access_token
     } catch (error) {
-      console.error('Error al intercambiar el código por un token:');
-      if (axios.isAxiosError(error)) {
-        console.error('Status:', error.response?.status);
-        console.error('Headers:', error.response?.headers);
-        console.error('Data:', error.response?.data);
-      }
-      throw new HttpException(
+      throw new Error('Error al obtener el token: ' + error.message);
+    }
+  }
+
+  async validateToken(token: string): Promise<any> {
+    try {
+      const response = await axios.get(
+        'https://api.mercadolibre.com/users/me',
         {
-          status: error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
-          message: error.response?.data || 'Error desconocido',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
         },
-        error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
+
+      return response.data; // Devuelve los datos del usuario si el token es válido
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    } catch (error) {
+      return null; // Si el token es inválido, devuelve null
     }
   }
 }

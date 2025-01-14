@@ -1,12 +1,13 @@
 import { Module } from '@nestjs/common';
-import { PassportModule } from '@nestjs/passport';
-import { AuthService } from './auth.service';
-import { CookieAuthGuard } from './bearer.strategy';
-import { AuthController } from './auth.controller';
+import { MercadoLibreAuthController } from './mercado-libre-auth.controller'
+import { MercadoLibreAuthService } from './mercado-libre-auth.service'
+import { HttpModule } from '@nestjs/axios';
+import { ConfigModule } from '@nestjs/config';
+import { NotificationModule } from 'src/notification/notification.module';
 
 @Module({
-  imports: [PassportModule],
-  providers: [AuthService, CookieAuthGuard],
-  controllers: [AuthController],
+  imports: [HttpModule, ConfigModule,NotificationModule], // Importa HttpModule para hacer solicitudes HTTP a Mercado Libre
+  controllers: [MercadoLibreAuthController],
+  providers: [MercadoLibreAuthService ],
 })
 export class AuthModule {}

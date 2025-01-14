@@ -1,12 +1,9 @@
-import { Body, Controller, Get, Post, Query, Redirect, Res } from '@nestjs/common';
+import { Controller, Get, Post, Query, Redirect } from '@nestjs/common';
 import { MercadoLibreAuthService } from './mercado-libre-auth.service';
-import { Response } from 'express';
-import { NotificationService } from 'src/notification/notification.service';
 
 @Controller('auth')
 export class MercadoLibreAuthController {
-  constructor(private readonly authService: MercadoLibreAuthService,
-    private readonly notificacionService: NotificationService
+  constructor(private readonly authService: MercadoLibreAuthService
   ) {}
 
   @Get('login')
@@ -39,18 +36,5 @@ export class MercadoLibreAuthController {
   async getUserInfo(@Query('token') token: string) {
     return await this.authService.getUserInfo(token);
   }
-
-  @Post('notifications')
-  async handleNotification(@Body() eventData: any, @Res() res: Response): Promise<any> {
-    try {
-    // Llamar al servicio para manejar la notificación
-    this.notificacionService.handleNotification(eventData);
   
-   // Responder con éxito y código de estado 200
-   return res.status(200).json({ message: 'Evento recibido con éxito' });
-} catch (error) {
-  console.error('Error al manejar la notificación:', error);
-  return res.status(500).json({ message: 'Error al manejar la notificación' });
-}
-  }
 }

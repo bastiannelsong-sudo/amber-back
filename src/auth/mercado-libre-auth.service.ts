@@ -2,6 +2,7 @@ import { HttpService } from '@nestjs/axios';
 import { Injectable, HttpException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { lastValueFrom } from 'rxjs';
+import { Session } from './entities/session.entity';
 
 @Injectable()
 export class MercadoLibreAuthService {
@@ -11,7 +12,10 @@ export class MercadoLibreAuthService {
   private authUrl: string;
   private tokenUrl: string;
 
-  constructor(private configService: ConfigService, private httpService: HttpService) {
+  constructor(
+    private configService: ConfigService,
+    private httpService: HttpService,
+  ) {
     this.clientId = this.configService.get<string>('CLIENT_ID');
     this.clientSecret = this.configService.get<string>('CLIENT_SECRET');
     this.redirectUri = this.configService.get<string>('REDIRECT_URI');
@@ -59,21 +63,5 @@ export class MercadoLibreAuthService {
       throw new Error('Error al obtener información del usuario');
     }
   }
-
-  handleNotification(eventData: any): void {
-    // Loguear el evento recibido
-    this.logger.log('Evento recibido:', JSON.stringify(eventData, null, 2));
-
-    // Extraer información importante del evento
-    const { action, resource } = eventData;
-    if (action === 'payment' && resource.status === 'approved') {
-      resource.order_items.forEach((item: any) => {
-        const itemId = item.item_id;
-        const quantity = item.quantity;
-        
-        // Lógica para descontar el stock
-        
-      });
-    }
-  }
 }
+

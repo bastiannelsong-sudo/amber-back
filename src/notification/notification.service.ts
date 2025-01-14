@@ -6,12 +6,15 @@ import { HttpService } from '@nestjs/axios';
 import { AxiosResponse } from 'axios';
 import { Session } from 'src/auth/entities/session.entity';
 import { ConfigService } from '@nestjs/config';
+import { firstValueFrom } from 'rxjs';
 
 @Injectable()
 export class NotificationService {
   private clientId: string;
   private clientSecret: string;
   private apiUrl: string;
+
+  private refreshAttemptCount: number = 0;
 
   constructor(
     @InjectRepository(Notification)
@@ -23,18 +26,15 @@ export class NotificationService {
     private readonly httpService: HttpService,
     private configService: ConfigService,
   ) {
-    // Acceso a las variables de entorno desde ConfigService
     this.clientId = this.configService.get<string>('CLIENT_ID');
     this.clientSecret = this.configService.get<string>('CLIENT_SECRET');
-    this.apiUrl = this.configService.get<string>('MERCADO_LIBRE_API_URL')
+    this.apiUrl = this.configService.get<string>('MERCADO_LIBRE_API_URL');
   
-    
-    // Validación para asegurar que las variables están disponibles
     if (!this.clientId || !this.clientSecret || !this.apiUrl) {
       throw new Error('Faltan las variables de configuración necesarias (CLIENT_ID, CLIENT_SECRET)');
     }
 
-    console.log('CLIENT_ID:', this.clientId); // Verificación de que las variables se cargan correctamente
+    console.log('CLIENT_ID:', this.clientId);
     console.log('CLIENT_SECRET:', this.clientSecret);
   }
 
@@ -75,35 +75,54 @@ export class NotificationService {
       session = await this.sessionRepository.findOne({ where: { user_id: notification.user_id } });
 
       if (!session) {
-        throw new Error('No se encontró sesión activa');
+        console.log('No se encontró sesión activa para el usuario:', notification.user_id);
+        // No se lanza un error, solo se loguea el problema y retornamos un valor por defecto
+        return { error: 'No se encontró sesión activa' }; // Aquí puedes devolver lo que consideres necesario
       }
 
       const accessToken = session.access_token;
+      console.log('Intentando acceder con el token:', accessToken);
 
-      const response: AxiosResponse = await this.httpService
-        .get(`${this.apiUrl}${notification.resource}`, {
+      const response: AxiosResponse = await firstValueFrom(
+        this.httpService.get(`${this.apiUrl}${notification.resource}`, {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
-        })
-        .toPromise();
+        }),
+      );
 
       return response.data;
     } catch (error) {
       if (error.response?.status === 401) {
-        console.log('El token ha expirado. Haciendo refresh...');
+        console.log('401: El token ha expirado. Intentando hacer refresh...');
+        
+        if (this.refreshAttemptCount >= 1) {
+          console.log('Se ha intentado refrescar el token anteriormente, pero falló. No se intentará más.');
+          throw new Error('No se pudo refrescar el token tras múltiples intentos.');
+        }
 
         const refreshToken = session.refresh_token;
-        const newTokens = await this.refreshAccessToken(refreshToken);
+        try {
+          this.refreshAttemptCount++;
 
-        await this.sessionRepository.update(session.id, {
-          access_token: newTokens.access_token,
-          expires_in: newTokens.expires_in,
-          refresh_token: newTokens.refresh_token,
-        });
+          console.log('Intentando refrescar el token...');
+          const newTokens = await this.refreshAccessToken(refreshToken);
 
-        return this.getOrderDetails(notification);
+          await this.sessionRepository.update(session.id, {
+            access_token: newTokens.access_token,
+            expires_in: newTokens.expires_in,
+            refresh_token: newTokens.refresh_token,
+          });
+
+          this.refreshAttemptCount = 0;
+
+          return this.getOrderDetails(notification);
+        } catch (refreshError) {
+          console.log('No se pudo refrescar el token:', refreshError.message);
+          throw new Error('No se pudo refrescar el token.');
+        }
       } else {
+        console.log('Error en la solicitud:', error.message);
         throw error;
       }
     }
@@ -111,8 +130,9 @@ export class NotificationService {
 
   private async refreshAccessToken(refreshToken: string): Promise<any> {
     try {
-      const response = await this.httpService
-        .post(
+      console.log('Realizando solicitud para refrescar el token...');
+      const response = await firstValueFrom(
+        this.httpService.post(
           `${this.apiUrl}/oauth/token`,
           new URLSearchParams({
             grant_type: 'refresh_token',
@@ -120,11 +140,12 @@ export class NotificationService {
             client_secret: this.clientSecret,
             refresh_token: refreshToken,
           }).toString(),
-        )
-        .toPromise();
+        ),
+      );
 
       return response.data;
     } catch (error) {
+      console.log('Error al obtener nuevo access_token:', error.message);
       throw new Error('Error al obtener nuevo access_token: ' + error.message);
     }
   }

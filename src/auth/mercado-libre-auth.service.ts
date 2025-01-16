@@ -60,7 +60,7 @@ export class MercadoLibreAuthService {
       );
       return response.data;
     } catch (error) {
-      throw new Error('Error al obtener información del usuario');
+      console.error('Error al obtener información del usuario');
     }
   }
 }

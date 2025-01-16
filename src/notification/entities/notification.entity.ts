@@ -28,4 +28,7 @@ export class Notification {
 
   @Column('simple-array', { nullable: true })
   actions: string[];
+
+  @Column({ type: 'boolean', default: false })  // Nueva columna 'processed'
+  processed: boolean;
 }

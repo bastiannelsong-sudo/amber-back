@@ -1,11 +1,11 @@
-import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, OneToMany } from 'typeorm';
+import { Entity, Column, ManyToOne, OneToMany, PrimaryColumn } from 'typeorm';
 import { User } from './user.entity';
 import { OrderItem } from './order-item.entity';
 
 @Entity()
 export class Order {
-  @PrimaryGeneratedColumn()
-  id: number;
+  @PrimaryColumn({ type: 'bigint' }) // Definir la clave primaria con tipo bigint
+  id: number; // Cambiar BigInt a number en TypeScript
 
   @Column()
   date_created: Date;

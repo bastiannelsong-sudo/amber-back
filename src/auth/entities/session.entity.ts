@@ -1,10 +1,8 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 
 @Entity('sessions')
 export class Session {
-  static id(id: any, arg1: { access_token: any; expires_in: any; refresh_token: any; }) {
-    throw new Error('Method not implemented.');
-  }
+
   @PrimaryGeneratedColumn()
   id: number;
 
@@ -28,5 +26,7 @@ export class Session {
 
   @CreateDateColumn({ type: 'timestamp' })
   created_at: Date;
-  static refresh_token: any;
+
+  @UpdateDateColumn({ type: 'timestamp' })
+  updated_at: Date;
 }

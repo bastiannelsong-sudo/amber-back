@@ -12,20 +12,24 @@ export class NotificationController {
     return this.notificationService.findAll();
   }
 
+
   @Post()
   async handleNotification(
-    @Body() eventData: any,
+    @Body() notification: Notification,
     @Res() res: Response,
-  ): Promise<any> {
+  ): Promise<void> {
     try {
-      this.notificationService.handleNotification(eventData);
+      // Guardar la notificación en la base de datos
+      await this.notificationService.saveNotification(notification);
 
-      return res.status(200).json({ message: 'Evento recibido con éxito' });
+      // Responder al cliente con éxito después de guardar
+      res.status(200).json({ message: 'Evento recibido con éxito' });
+
+      // Procesar la notificación de manera asíncrona
+      this.notificationService.handleNotificationAsync(notification);
     } catch (error) {
       console.error('Error al manejar la notificación:', error);
-      return res
-        .status(500)
-        .json({ message: 'Error al manejar la notificación' });
+      res.status(500).json({ message: 'Error al manejar la notificación' });
     }
   }
 }

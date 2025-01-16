@@ -7,10 +7,14 @@ import { AuthModule } from '../auth/auth.module'; // Importa AuthModule
 import { HttpModule } from '@nestjs/axios';
 import { Session } from 'src/auth/entities/session.entity';
 import { ConfigModule } from '@nestjs/config';
+import { Order } from 'src/orders/entities/order.entity';
+import { User } from 'src/orders/entities/user.entity';
+import { OrderItem } from 'src/orders/entities/order-item.entity';
+import { Payment } from 'src/orders/entities/payment.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Notification, Session]), // Registrar las entidades
+    TypeOrmModule.forFeature([Notification, Session,Order,User,OrderItem,Payment]), // Registrar las entidades
     AuthModule, 
     ConfigModule, // Asegura que ConfigModule esté importado
     HttpModule, // Importar el módulo de HTTP

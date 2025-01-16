@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { User } from './orders/entities/user.entity';
 import { Order } from './orders/entities/order.entity';
 import { OrderItem } from './orders/entities/order-item.entity';
@@ -12,32 +13,32 @@ import { Session } from './auth/entities/session.entity';
 import { NotificationController } from './notification/notification.controller';
 import { NotificationService } from './notification/notification.service';
 import { HttpModule } from '@nestjs/axios';
-import { ConfigModule } from '@nestjs/config';
-import * as path from 'path'; // Importar para resolver el path del archivo .env
 
 @Module({
   imports: [
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: 'localhost',
-      port: 5432,
-      username: 'postgres',
-      password: '123456',
-      database: 'amber',
-      entities: [User, Order, OrderItem, Payment, Notification, Session],
-      synchronize: true, // Solo en desarrollo, para producción deshabilitar esto
+    ConfigModule.forRoot({
+      isGlobal: true,
+      envFilePath: '.env',
+    }),
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: (configService: ConfigService) => ({
+        type: 'postgres',
+        host: configService.get<string>('DB_HOST'),
+        port: configService.get<number>('DB_PORT'),
+        username: configService.get<string>('DB_USERNAME'),
+        password: configService.get<string>('DB_PASSWORD'),
+        database: configService.get<string>('DB_DATABASE'),
+        entities: [User, Order, OrderItem, Payment, Notification, Session],
+        synchronize: true,
+      }),
+      inject: [ConfigService],
     }),
     TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session]),
     OrderModule,
     AuthModule,
     NotificationModule,
     HttpModule,
-    
-    // ConfigModule con configuración para cargar el archivo .env
-    ConfigModule.forRoot({
-      isGlobal: true, // Hace que las variables de entorno sean accesibles globalmente
-      envFilePath: '.env', // Carga el archivo .env desde la raíz
-    }),
   ],
   controllers: [NotificationController],
   providers: [NotificationService],

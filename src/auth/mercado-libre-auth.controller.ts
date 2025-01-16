@@ -1,9 +1,23 @@
-import { Controller, Get, Post, Query, Redirect } from '@nestjs/common';
+import {
+  BadRequestException,
+  Controller,
+  Delete,
+  Get,
+  HttpException,
+  HttpStatus,
+  Param,
+  Post,
+  Query,
+  Redirect,
+} from '@nestjs/common';
 import { MercadoLibreAuthService } from './mercado-libre-auth.service';
+import { Session } from './entities/session.entity';
+import { SessionCacheService } from './session-cache.service';
 
 @Controller('auth')
 export class MercadoLibreAuthController {
-  constructor(private readonly authService: MercadoLibreAuthService
+  constructor(private readonly authService: MercadoLibreAuthService,
+              private readonly sessionCacheService: SessionCacheService
   ) {}
 
   @Get('login')
@@ -20,21 +34,30 @@ export class MercadoLibreAuthController {
       return { message: 'Authorization code not provided' };
     }
 
-    const tokenData = await this.authService.exchangeCodeForToken(code);
-    console.log(tokenData);
+    const tokenData:Session = await this.authService.exchangeCodeForToken(code);
 
-    // Redirigir al frontend con el mensaje y el tokenData en los parámetros de la URL
-    const redirectUrl = `http://localhost:5173/callback?message=Successfully%20authenticated&tokenData=${encodeURIComponent(
-      JSON.stringify(tokenData),
-    )}`;
+    const redirectUrl = `http://localhost:5173/callback?message=Successfully%20authenticated&userId=${tokenData.user_id}`
 
-    // Realizar la redirección
     return { url: redirectUrl };
   }
 
   @Get('user-info')
-  async getUserInfo(@Query('token') token: string) {
-    return await this.authService.getUserInfo(token);
+  async getUserInfo(@Query('userId') userId: number)
+  {
+    return await this.authService.getUserInfo(userId);
+  }
+
+  @Delete(':userId')
+  async deleteSession(@Param('userId') userId: number): Promise<string> {
+    try {
+      this.sessionCacheService.deleteSession(userId);
+      return `Sesión eliminada para el usuario con ID: ${userId}`;
+    } catch (error) {
+      throw new HttpException(
+        `No se pudo eliminar la sesión para el usuario con ID: ${userId}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
   }
   
 }

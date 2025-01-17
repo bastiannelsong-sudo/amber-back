@@ -13,6 +13,7 @@ import { Session } from './auth/entities/session.entity';
 import { NotificationController } from './notification/notification.controller';
 import { NotificationService } from './notification/notification.service';
 import { HttpModule } from '@nestjs/axios';
+import { AuditLog } from './notification/entities/audit-log.entity';
 
 @Module({
   imports: [
@@ -29,16 +30,17 @@ import { HttpModule } from '@nestjs/axios';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session],
+        entities: [User, Order, OrderItem, Payment, Notification, Session,AuditLog],
         synchronize: true,
       }),
       inject: [ConfigService],
     }),
-    TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session]),
+    TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session,AuditLog]),
     OrderModule,
     AuthModule,
     NotificationModule,
     HttpModule,
+
   ],
   controllers: [NotificationController],
   providers: [NotificationService],

@@ -1,6 +1,7 @@
 import { Entity, Column, ManyToOne, OneToMany, PrimaryColumn } from 'typeorm';
 import { User } from './user.entity';
 import { OrderItem } from './order-item.entity';
+import { Payment } from './payment.entity';
 
 @Entity()
 export class Order {
@@ -39,4 +40,15 @@ export class Order {
 
   @OneToMany(() => OrderItem, (item) => item.order)
   items: OrderItem[];
+
+  @OneToMany(() => Payment, (payment) => payment.order)  // Relación con Payment
+  payments: Payment[];
+
+  // Agregar el campo fulfilled
+  @Column({ type: 'boolean', default: false })
+  fulfilled: boolean;
+
+  // Agregar el campo tags
+  @Column("simple-array", { nullable: true })
+  tags: string[];
 }

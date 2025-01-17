@@ -11,15 +11,18 @@ import { Order } from 'src/orders/entities/order.entity';
 import { User } from 'src/orders/entities/user.entity';
 import { OrderItem } from 'src/orders/entities/order-item.entity';
 import { Payment } from 'src/orders/entities/payment.entity';
+import { AuditService } from './audit.service';
+import { AuditLog } from './entities/audit-log.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Notification, Session,Order,User,OrderItem,Payment]), // Registrar las entidades
-    AuthModule, 
+    TypeOrmModule.forFeature([Notification,Session,Order,User,OrderItem,Payment,AuditLog]), // Registrar las entidades
+    AuthModule,
     ConfigModule, // Asegura que ConfigModule esté importado
     HttpModule, // Importar el módulo de HTTP
   ],
   controllers: [NotificationController],
-  providers: [NotificationService],
+  providers: [NotificationService,AuditService],
+  exports: [AuditService]
 })
 export class NotificationModule {}

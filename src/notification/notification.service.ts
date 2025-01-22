@@ -15,9 +15,9 @@ import { AuditService } from './audit.service';
 
 @Injectable()
 export class NotificationService {
-  private clientId: string;
-  private clientSecret: string;
-  private apiUrl: string;
+  private readonly clientId: string;
+  private readonly clientSecret: string;
+  private readonly apiUrl: string;
 
   private refreshAttemptCount: number = 0;
 
@@ -71,174 +71,31 @@ export class NotificationService {
   async findAll(): Promise<Notification[]> {
     return this.notificationRepository.find();
   }
+
+
   async handleNotificationAsync(notification: Notification): Promise<void> {
     try {
       if (notification.processed) {
         console.log('Notificación ya procesada, se omite...');
-        return; // Evitar procesar notificaciones ya procesadas
+        return;
       }
+
       console.log('Evento recibido:', notification);
 
-      if(notification.topic.trim().toLowerCase() == "orders_v2") {
-
+      if (notification.topic.trim().toLowerCase() === 'orders_v2') {
         const orderDetails = await this.getOrderDetails(notification);
+        if (orderDetails.error) return;
 
-        // Guardar o actualizar el comprador (buyer)
-        let buyer = await this.userRepository.findOne({ where: { id: orderDetails.buyer.id } });
-        if (buyer) {
-          // Si existe, actualizar los detalles del comprador
-          buyer.nickname = orderDetails.buyer.nickname;
-          buyer.first_name = orderDetails.buyer.first_name;
-          buyer.last_name = orderDetails.buyer.last_name;
-        } else {
-          // Si no existe, crear un nuevo comprador
-          buyer = this.userRepository.create({
-            id: orderDetails.buyer.id,
-            nickname: orderDetails.buyer.nickname,
-            first_name: orderDetails.buyer.first_name,
-            last_name: orderDetails.buyer.last_name,
-          });
-        }
-        await this.userRepository.save(buyer); // `save` manejará tanto creación como actualización
+        await this.saveBuyer(orderDetails.buyer);
+        await this.saveSeller(orderDetails.seller);
 
-        // Guardar o actualizar el vendedor (seller)
-        let seller = await this.userRepository.findOne({ where: { id: orderDetails.seller.id } });
-        if (seller) {
-          // Si existe, actualizar los detalles del vendedor
-          seller.nickname = 'null'; // Se proporciona 'null' si no se encuentra en los detalles
-          seller.first_name = 'null';
-          seller.last_name = 'null';
-        } else {
-          // Si no existe, crear un nuevo vendedor
-          seller = this.userRepository.create({
-            id: orderDetails.seller.id,
-            nickname: 'null',
-            first_name: 'null',
-            last_name: 'null',
-          });
-        }
-        await this.userRepository.save(seller); // `save` manejará tanto creación como actualización
+        const order = await this.saveOrder(orderDetails);
 
-        let order = await this.orderRepository.findOne({
-          where: { id: orderDetails.id },
-          relations: ['buyer', 'seller', 'items', 'items.order', 'payments'], // Agregar 'payments' a las relaciones
-        });
+        await this.saveOrderItems(orderDetails.order_items, order);
+        await this.savePayments(orderDetails.payments, order);
 
-        const oldOrder = { ...order }; // Guarda una copia para comparación
-        if (order) {
-          // Si la orden existe, actualizar los campos
-          order.date_created = new Date(orderDetails.date_created);
-          order.last_updated = new Date(orderDetails.last_updated);
-          order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
-          order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
-          order.status = orderDetails.status;
-          order.total_amount = orderDetails.total_amount;
-          order.paid_amount = orderDetails.paid_amount;
-          order.tags = orderDetails.tags;
-          order.currency_id = orderDetails.currency_id;
-          order.buyer = buyer; // Asegúrate de que los objetos buyer y seller estén asignados
-          order.seller = seller;
-          order.fulfilled = orderDetails.fulfilled === null ? false : orderDetails.fulfilled;
+        await this.detectAndLogOrderChanges(orderDetails, order);
 
-        } else {
-          // Si no existe, crear una nueva orden
-          order = this.orderRepository.create({
-            id: orderDetails.id,
-            date_created: new Date(orderDetails.date_created),
-            last_updated: new Date(orderDetails.last_updated),
-            expiration_date: orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null,
-            date_closed: orderDetails.date_closed ? new Date(orderDetails.date_closed) : null,
-            status: orderDetails.status,
-            tags:  orderDetails.tags,
-            total_amount: orderDetails.total_amount,
-            paid_amount: orderDetails.paid_amount,
-            currency_id: orderDetails.currency_id,
-            buyer: buyer,
-            seller: seller,
-            fulfilled: orderDetails.fulfilled === null ? false : orderDetails.fulfilled
-
-          });
-        }
-        await this.orderRepository.save(order); // `save` manejará tanto creación como actualización
-
-
-
-        // Guardar o actualizar los items de la orden
-        const items = await Promise.all(orderDetails.order_items.map(async (itemDetail: any) => {
-          let item = await this.orderItemRepository.createQueryBuilder('orderItem')
-            .where('orderItem.item_id = :itemId', { itemId: itemDetail.item.id })
-            .andWhere('orderItem.orderId = :orderId', { orderId: order.id }).
-            getOne();
-
-          if (item) {
-            // Si el item ya existe, actualizar los detalles
-            item.title = itemDetail.item.title;
-            item.category_id = itemDetail.item.category_id;
-            item.quantity = itemDetail.quantity;
-            item.unit_price = itemDetail.unit_price;
-            item.full_unit_price = itemDetail.full_unit_price;
-            item.currency_id = itemDetail.currency_id;
-            item.condition = itemDetail.item.condition;
-            item.warranty = itemDetail.item.warranty || '';
-          } else {
-            // Si no existe, crear un nuevo item
-            item = this.orderItemRepository.create({
-              order: order,
-              item_id: itemDetail.item.id,
-              title: itemDetail.item.title,
-              category_id: itemDetail.item.category_id,
-              quantity: itemDetail.quantity,
-              unit_price: itemDetail.unit_price,
-              full_unit_price: itemDetail.full_unit_price,
-              currency_id: itemDetail.currency_id,
-              condition: itemDetail.item.condition,
-              warranty: itemDetail.item.warranty || '',
-            });
-          }
-          return item;
-        }));
-        await this.orderItemRepository.save(items); // `save` manejará tanto creación como actualización
-
-        // Guardar o actualizar los pagos de la orden
-        const payments = await Promise.all(orderDetails.payments.map(async (paymentDetail: any) => {
-          let payment = await this.paymentRepository.findOne({ where: { id: paymentDetail.id} });
-          if (payment) {
-            // Si el pago ya existe, actualizar los detalles
-            payment.payment_method_id = paymentDetail.payment_method_id;
-            payment.payment_type = paymentDetail.payment_type;
-            payment.status = paymentDetail.status;
-            payment.transaction_amount = paymentDetail.transaction_amount;
-            payment.shipping_cost = paymentDetail.shipping_cost;
-            payment.marketplace_fee = paymentDetail.marketplace_fee;
-            payment.total_paid_amount = paymentDetail.total_paid_amount;
-            payment.date_approved = new Date(paymentDetail.date_approved);
-            payment.currency_id = paymentDetail.currency_id;
-          } else {
-            // Si no existe, crear un nuevo pago
-            payment = this.paymentRepository.create({
-              id: paymentDetail.id,
-              order: order,
-              payment_method_id: paymentDetail.payment_method_id,
-              payment_type: paymentDetail.payment_type,
-              status: paymentDetail.status,
-              transaction_amount: paymentDetail.transaction_amount,
-              shipping_cost: paymentDetail.shipping_cost,
-              marketplace_fee: paymentDetail.marketplace_fee,
-              total_paid_amount: paymentDetail.total_paid_amount,
-              date_approved: new Date(paymentDetail.date_approved),
-              currency_id: paymentDetail.currency_id,
-            });
-          }
-          return payment;
-        }));
-        await this.paymentRepository.save(payments); // `save` manejará tanto creación como actualización
-        // Detecta los cambios en la orden
-        const orderChanges = this.detectChanges(oldOrder, order);
-
-        // Registrar los cambios en auditoría
-        await this.auditService.logAudit('order: '+orderDetails.id, 'update', {
-          order: orderChanges,
-        });
         notification.processed = true;
         await this.notificationRepository.save(notification);
 
@@ -247,6 +104,190 @@ export class NotificationService {
     } catch (error) {
       console.error('Error durante el procesamiento de la notificación:', error);
     }
+  }
+
+  private async saveBuyer(buyerDetails: any): Promise<void> {
+    let buyer = await this.userRepository.findOne({ where: { id: buyerDetails.id } });
+
+    if (!buyer) {
+      buyer = this.userRepository.create({
+        id: buyerDetails.id,
+        nickname: buyerDetails.nickname,
+        first_name: buyerDetails.first_name,
+        last_name: buyerDetails.last_name,
+      });
+    } else {
+      buyer.nickname = buyerDetails.nickname;
+      buyer.first_name = buyerDetails.first_name;
+      buyer.last_name = buyerDetails.last_name;
+    }
+
+    await this.userRepository.save(buyer);
+  }
+
+  private async saveSeller(sellerDetails: any): Promise<void> {
+    let seller = await this.userRepository.findOne({ where: { id: sellerDetails.id } });
+
+    if (!seller) {
+      seller = this.userRepository.create({
+        id: sellerDetails.id
+      });
+    }
+
+
+    await this.userRepository.save(seller);
+  }
+
+  private async saveOrder(orderDetails: any): Promise<Order> {
+    let order = await this.orderRepository.findOne({
+      where: { id: orderDetails.id },
+      relations: ['buyer', 'seller', 'items', 'items.order', 'payments'],
+    });
+
+    if (!order) {
+      // Si la orden no existe, se crea una nueva
+      order = this.orderRepository.create({
+        id: orderDetails.id,
+        date_created: new Date(orderDetails.date_created),
+        last_updated: new Date(orderDetails.last_updated),
+        expiration_date: orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null,
+        date_closed: orderDetails.date_closed ? new Date(orderDetails.date_closed) : null,
+        status: orderDetails.status,
+        tags: orderDetails.tags,
+        total_amount: orderDetails.total_amount,
+        paid_amount: orderDetails.paid_amount,
+        currency_id: orderDetails.currency_id,
+        buyer: orderDetails.buyer,
+        seller: orderDetails.seller,
+        fulfilled: orderDetails.fulfilled ?? false,
+      });
+
+      // Llamar a la API para obtener el logistic_type al crear la orden
+      const shippingId = orderDetails.shipping?.id;
+      if (shippingId) {
+        order.shipping_id = shippingId;
+        try {
+          const logisticType = await this.getLogisticType(orderDetails);
+          order.logistic_type = logisticType;
+        } catch (error) {
+          console.error('Error al obtener logistic_type:', error.message);
+          order.logistic_type = 'Unknown';
+        }
+      }
+    } else {
+
+      order.date_created = new Date(orderDetails.date_created);
+      order.last_updated = new Date(orderDetails.last_updated);
+      order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
+      order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
+      order.status = orderDetails.status;
+      order.total_amount = orderDetails.total_amount;
+      order.paid_amount = orderDetails.paid_amount;
+      order.tags = orderDetails.tags;
+      order.currency_id = orderDetails.currency_id;
+      order.buyer = orderDetails.buyer;
+      order.seller = orderDetails.seller;
+      order.fulfilled = orderDetails.fulfilled ?? false;
+
+      // Si el shipping_id ha cambiado, llamamos a la API para obtener el logistic_type
+      const shippingId = orderDetails.shipping?.id;
+      if (shippingId && shippingId !== order.shipping_id) {
+        order.shipping_id = shippingId;
+        try {
+          const logisticType = await this.getLogisticType(orderDetails);
+          order.logistic_type = logisticType;
+        } catch (error) {
+          console.error('Error al obtener logistic_type:', error.message);
+          order.logistic_type = 'Unknown'; // Asignamos un valor por defecto en caso de error
+        }
+      }
+    }
+
+    // Guardar la orden en la base de datos
+    await this.orderRepository.save(order);
+
+    return order;
+  }
+
+  private async saveOrderItems(orderItems: any[], order: Order): Promise<void> {
+    const items = await Promise.all(orderItems.map(async (itemDetail: any) => {
+      let item = await this.orderItemRepository.createQueryBuilder('orderItem')
+        .where('orderItem.item_id = :itemId', { itemId: itemDetail.item.id })
+        .andWhere('orderItem.orderId = :orderId', { orderId: order.id }).
+        getOne();
+
+      if (!item) {
+        item = this.orderItemRepository.create({
+          order: order,
+          item_id: itemDetail.item.id,
+          title: itemDetail.item.title,
+          category_id: itemDetail.item.category_id,
+          quantity: itemDetail.quantity,
+          unit_price: itemDetail.unit_price,
+          full_unit_price: itemDetail.full_unit_price,
+          currency_id: itemDetail.currency_id,
+          condition: itemDetail.item.condition,
+          warranty: itemDetail.item.warranty ?? '',
+        });
+      } else {
+        item.title = itemDetail.item.title;
+        item.category_id = itemDetail.item.category_id;
+        item.quantity = itemDetail.quantity;
+        item.unit_price = itemDetail.unit_price;
+        item.full_unit_price = itemDetail.full_unit_price;
+        item.currency_id = itemDetail.currency_id;
+        item.condition = itemDetail.item.condition;
+        item.warranty = itemDetail.item.warranty ?? '';
+      }
+
+      return item;
+    }));
+
+    await this.orderItemRepository.save(items);
+  }
+
+  private async savePayments(payments: any[], order: Order): Promise<void> {
+    const paymentPromises = payments.map(async (paymentDetail: any) => {
+      let payment = await this.paymentRepository.findOne({ where: { id: paymentDetail.id } });
+
+      if (!payment) {
+        payment = this.paymentRepository.create({
+          id: paymentDetail.id,
+          order: order,
+          payment_method_id: paymentDetail.payment_method_id,
+          payment_type: paymentDetail.payment_type,
+          status: paymentDetail.status,
+          transaction_amount: paymentDetail.transaction_amount,
+          shipping_cost: paymentDetail.shipping_cost,
+          marketplace_fee: paymentDetail.marketplace_fee,
+          total_paid_amount: paymentDetail.total_paid_amount,
+          date_approved: new Date(paymentDetail.date_approved),
+          currency_id: paymentDetail.currency_id,
+        });
+      } else {
+        payment.payment_method_id = paymentDetail.payment_method_id;
+        payment.payment_type = paymentDetail.payment_type;
+        payment.status = paymentDetail.status;
+        payment.transaction_amount = paymentDetail.transaction_amount;
+        payment.shipping_cost = paymentDetail.shipping_cost;
+        payment.marketplace_fee = paymentDetail.marketplace_fee;
+        payment.total_paid_amount = paymentDetail.total_paid_amount;
+        payment.date_approved = new Date(paymentDetail.date_approved);
+        payment.currency_id = paymentDetail.currency_id;
+      }
+
+      return payment;
+    });
+
+    await this.paymentRepository.save(await Promise.all(paymentPromises));
+  }
+
+  private async detectAndLogOrderChanges(oldOrder: Order, newOrder: Order): Promise<void> {
+    // Esperamos que detectChanges termine antes de continuar.
+    const orderChanges = await this.detectChanges(oldOrder, newOrder);
+
+    // Logueamos el cambio de la orden.
+    await this.auditService.logAudit('order: ' + newOrder.id, 'update', { order: orderChanges });
   }
 
 
@@ -285,6 +326,41 @@ export class NotificationService {
       } else {
         console.error('Error en la solicitud:', error.message);
       }
+    }
+  }
+
+  private async getLogisticType(order: Order): Promise<string> {
+    let session: Session | null = null;
+    try {
+      // Buscar la sesión activa para el usuario asociado a la orden
+      session = await this.sessionRepository.findOne({
+        where: { user_id: order.seller.id  },
+      });
+
+      if (!session) {
+        console.log('No se encontró sesión activa para la orden:', order.seller.id);
+        return 'Unknown'; // Si no se encuentra la sesión, devolvemos un valor por defecto
+      }
+
+      
+      const accessToken = session.access_token;
+      console.log('Intentando acceder con el token:', accessToken);
+
+  
+      const response: AxiosResponse = await firstValueFrom(
+        this.httpService.get(`https://api.mercadolibre.com/orders/${order.id}/shipments`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }),
+      );
+      
+      return response.data.logistic_type;
+    } catch (error) {
+     
+        console.error('Error al obtener logistic_type:', error.message);
+        return 'Unknown'; 
+      
     }
   }
 
@@ -342,13 +418,12 @@ export class NotificationService {
     }
   }
 
-  detectChanges(oldEntity: any, newEntity: any): EntityChanges {
+  async detectChanges(oldEntity: any, newEntity: any): Promise<EntityChanges> {
     const changes: EntityChanges = {};
 
     // Define propiedades que no quieres comparar
     const excludedProperties = ['someExcludedProperty', 'anotherExcludedProperty'];
 
-    // Recorremos todas las propiedades de newEntity
     for (let key in newEntity) {
       // Omitir propiedades excluidas
       if (excludedProperties.includes(key)) {
@@ -360,7 +435,6 @@ export class NotificationService {
 
       // Verificar si ambos valores son objetos
       if (this.isObject(newValue) && this.isObject(oldValue)) {
-        // Comparar los objetos de manera profunda
         if (!this.deepEqual(oldValue, newValue)) {
           changes[key] = {
             column: key,
@@ -371,7 +445,6 @@ export class NotificationService {
       }
       // Verificar si ambos valores son arrays
       else if (Array.isArray(newValue) && Array.isArray(oldValue)) {
-        // Comparar arrays de manera profunda
         if (!this.deepEqual(oldValue, newValue)) {
           changes[key] = {
             column: key,
@@ -380,9 +453,19 @@ export class NotificationService {
           };
         }
       }
-      // Verificar si ambas propiedades son fechas
+      // Comparar fechas, teniendo en cuenta las zonas horarias
       else if (newValue instanceof Date && oldValue instanceof Date) {
-        if (newValue.getTime() !== oldValue.getTime()) {
+        if (this.areDatesDifferent(oldValue, newValue)) {
+          changes[key] = {
+            column: key,
+            oldValue: oldValue.toISOString(),
+            newValue: newValue.toISOString(),
+          };
+        }
+      }
+      // Comparar valores booleanos
+      else if (typeof newValue === 'boolean' && typeof oldValue === 'boolean') {
+        if (newValue !== oldValue) {
           changes[key] = {
             column: key,
             oldValue: oldValue,
@@ -390,7 +473,7 @@ export class NotificationService {
           };
         }
       }
-      // Verificar si las propiedades son números (montos)
+      // Comparación de valores numéricos (montos)
       else if (typeof newValue === 'number' && typeof oldValue === 'number') {
         if (newValue !== oldValue) {
           changes[key] = {
@@ -400,7 +483,7 @@ export class NotificationService {
           };
         }
       }
-      // Comparar números representados como cadenas
+      // Comparación de valores representados como cadenas numéricas
       else if ((typeof newValue === 'string' || typeof oldValue === 'string') && !isNaN(parseFloat(newValue))) {
         const oldAmount = parseFloat(oldValue);
         const newAmount = parseFloat(newValue);
@@ -422,16 +505,6 @@ export class NotificationService {
           };
         }
       }
-      // Comparación explícita de valores booleanos
-      else if (typeof newValue === 'boolean' && typeof oldValue === 'boolean') {
-        if (newValue !== oldValue) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
     }
 
     return changes;
@@ -444,30 +517,29 @@ export class NotificationService {
 
 // Función para comparar objetos y arrays de manera profunda
   private deepEqual(a: any, b: any): boolean {
-    if (a === b) {
-      return true;
-    }
+    if (a === b) return true;
 
     if (this.isObject(a) && this.isObject(b)) {
       const keysA = Object.keys(a);
       const keysB = Object.keys(b);
 
-      if (keysA.length !== keysB.length) {
-        return false;
-      }
+      if (keysA.length !== keysB.length) return false;
 
       return keysA.every((key) => this.deepEqual(a[key], b[key]));
     }
 
     if (Array.isArray(a) && Array.isArray(b)) {
-      if (a.length !== b.length) {
-        return false;
-      }
-
+      if (a.length !== b.length) return false;
       return a.every((item, index) => this.deepEqual(item, b[index]));
     }
 
     return false;
+  }
+
+// Función para comparar fechas de manera robusta, teniendo en cuenta las zonas horarias
+  private areDatesDifferent(oldDate: Date, newDate: Date): boolean {
+    // Compara las fechas en formato ISO, que es independiente de la zona horaria
+    return oldDate.toISOString() !== newDate.toISOString();
   }
 
 

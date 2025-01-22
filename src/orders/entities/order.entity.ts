@@ -51,4 +51,10 @@ export class Order {
   // Agregar el campo tags
   @Column("simple-array", { nullable: true })
   tags: string[];
+
+  @Column({ nullable: true })
+  shipping_id: string;  // Nuevo campo para el shipping_id
+
+  @Column({ nullable: true })
+  logistic_type: string; // Nuevo campo para el logistic_type
 }

@@ -5,7 +5,7 @@ import {
   Get,
   HttpException,
   HttpStatus,
-  Param,
+  Param, ParseIntPipe,
   Post,
   Query,
   Redirect,
@@ -42,13 +42,13 @@ export class MercadoLibreAuthController {
   }
 
   @Get('user-info')
-  async getUserInfo(@Query('userId') userId: number)
+  async getUserInfo(@Query('userId',ParseIntPipe) userId: number)
   {
     return await this.authService.getUserInfo(userId);
   }
 
   @Delete(':userId')
-  async deleteSession(@Param('userId') userId: number): Promise<string> {
+  async deleteSession(@Param('userId',ParseIntPipe) userId: number): Promise<string> {
     try {
       this.sessionCacheService.deleteSession(userId);
       return `Sesión eliminada para el usuario con ID: ${userId}`;

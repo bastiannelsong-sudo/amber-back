@@ -36,4 +36,8 @@ export class OrderItem {
 
   @Column()
   warranty: string;
+
+  @Column({nullable: true})
+  seller_sku: string;
+
 }

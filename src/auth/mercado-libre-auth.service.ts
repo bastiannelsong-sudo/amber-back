@@ -61,9 +61,10 @@ export class MercadoLibreAuthService {
 
   async saveToken(tokenData: any): Promise<Session> {
 
-    let session = await this.sessionRepository.findOne({ where: { user_id: tokenData.user_id } });
+    let session:Session = await this.sessionRepository.findOne({ where: { user_id: tokenData.user_id } });
 
     if (session) {
+      console.log(typeof session.user_id);
       // Si la sesión ya existe, actualizar los campos relevantes
       session.access_token = tokenData.access_token;
       session.expires_in = tokenData.expires_in;
@@ -102,7 +103,7 @@ export class MercadoLibreAuthService {
       const response = await lastValueFrom(
         this.httpService.get('https://api.mercadolibre.com/users/me', {
           headers: {
-            Authorization: `Bearer ${this.sessionCacheService.getSession(+userId).access_token}`,
+            Authorization: `Bearer ${this.sessionCacheService.getSession(userId).access_token}`,
           },
         }),
       );

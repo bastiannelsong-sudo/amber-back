@@ -57,4 +57,7 @@ export class Order {
 
   @Column({ nullable: true })
   logistic_type: string; // Nuevo campo para el logistic_type
+
+  @Column({ type: 'bigint', nullable: true })
+  pack_id: number;
 }

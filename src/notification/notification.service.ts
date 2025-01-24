@@ -160,15 +160,15 @@ export class NotificationService {
         buyer: orderDetails.buyer,
         seller: orderDetails.seller,
         fulfilled: orderDetails.fulfilled ?? false,
+        pack_id:orderDetails.pack_id,
       });
 
-      // Llamar a la API para obtener el logistic_type al crear la orden
+
       const shippingId = orderDetails.shipping?.id;
       if (shippingId) {
         order.shipping_id = shippingId;
         try {
-          const logisticType = await this.getLogisticType(orderDetails);
-          order.logistic_type = logisticType;
+          order.logistic_type = await this.getLogisticType(orderDetails);
         } catch (error) {
           console.error('Error al obtener logistic_type:', error.message);
           order.logistic_type = 'Unknown';
@@ -188,6 +188,7 @@ export class NotificationService {
       order.buyer = orderDetails.buyer;
       order.seller = orderDetails.seller;
       order.fulfilled = orderDetails.fulfilled ?? false;
+      order.pack_id = orderDetails.pack_id;
 
       // Si el shipping_id ha cambiado, llamamos a la API para obtener el logistic_type
       const shippingId = orderDetails.shipping?.id;
@@ -228,6 +229,7 @@ export class NotificationService {
           currency_id: itemDetail.currency_id,
           condition: itemDetail.item.condition,
           warranty: itemDetail.item.warranty ?? '',
+          seller_sku:itemDetail.seller_sku,
         });
       } else {
         item.title = itemDetail.item.title;
@@ -238,6 +240,7 @@ export class NotificationService {
         item.currency_id = itemDetail.currency_id;
         item.condition = itemDetail.item.condition;
         item.warranty = itemDetail.item.warranty ?? '';
+        item.seller_sku = itemDetail.seller_sku;
       }
 
       return item;

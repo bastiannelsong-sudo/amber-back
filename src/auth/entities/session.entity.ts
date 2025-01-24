@@ -21,7 +21,7 @@ export class Session {
   @Column({ type: 'text' })
   token_type: string;
 
-  @Column({ type: 'bigint' })
+  @Column({ type: 'int' })
   user_id: number;
 
   @CreateDateColumn({ type: 'timestamp' })

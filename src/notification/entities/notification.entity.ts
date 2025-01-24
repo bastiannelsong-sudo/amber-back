@@ -31,4 +31,5 @@ export class Notification {
 
   @Column({ type: 'boolean', default: false })  // Nueva columna 'processed'
   processed: boolean;
+
 }

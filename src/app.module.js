@@ -19,36 +19,35 @@ import { Product } from './products/entities/product.entity';
 import { Platform } from './products/entities/platform.entity';
 import { SecondarySku } from './products/entities/secondary-sku.entity';
 import { Category } from './products/entities/category.entity';
-
 @Module({
-  imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-      envFilePath: '.env',
-    }),
-    TypeOrmModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        type: 'postgres',
-        host: configService.get<string>('DB_HOST'),
-        port: configService.get<number>('DB_PORT'),
-        username: configService.get<string>('DB_USERNAME'),
-        password: configService.get<string>('DB_PASSWORD'),
-        database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session,AuditLog,Product,Platform,SecondarySku,Category],
-        synchronize: true,
-      }),
-      inject: [ConfigService],
-    }),
-    TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session,AuditLog]),
-    OrderModule,
-    AuthModule,
-    NotificationModule,
-    HttpModule,
-    ProductsModule
-
-  ],
-  controllers: [NotificationController],
-  providers: [NotificationService],
+    imports: [
+        ConfigModule.forRoot({
+            isGlobal: true,
+            envFilePath: '.env',
+        }),
+        TypeOrmModule.forRootAsync({
+            imports: [ConfigModule],
+            useFactory: (configService) => ({
+                type: 'postgres',
+                host: configService.get('DB_HOST'),
+                port: configService.get('DB_PORT'),
+                username: configService.get('DB_USERNAME'),
+                password: configService.get('DB_PASSWORD'),
+                database: configService.get('DB_DATABASE'),
+                entities: [User, Order, OrderItem, Payment, Notification, Session, AuditLog, Product, Platform, SecondarySku, Category],
+                synchronize: true,
+            }),
+            inject: [ConfigService],
+        }),
+        TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session, AuditLog]),
+        OrderModule,
+        AuthModule,
+        NotificationModule,
+        HttpModule,
+        ProductsModule
+    ],
+    controllers: [NotificationController],
+    providers: [NotificationService],
 })
-export class AppModule {}
+export class AppModule {
+}

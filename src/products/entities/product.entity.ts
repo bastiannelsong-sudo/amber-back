@@ -16,12 +16,6 @@ export class Product {
   @Column({ type: 'int' })
   stock: number;
 
-  @Column({ type: 'int', default: 0 })
-  to_repair: number;
-
-  @Column({ type: 'int' })
-  total: number;
-
   @OneToMany(() => SecondarySku, (secondarySku) => secondarySku.product)
   secondarySkus: SecondarySku[];
 

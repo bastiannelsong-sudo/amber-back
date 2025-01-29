@@ -36,7 +36,9 @@ export class MercadoLibreAuthController {
 
     const tokenData:Session = await this.authService.exchangeCodeForToken(code);
 
-    const redirectUrl = `http://localhost:5173/callback?message=Successfully%20authenticated&userId=${tokenData.user_id}`
+    const user = await this.authService.getUserInfo(tokenData.user_id);
+
+    const redirectUrl = `http://localhost:5173/callback?message=Successfully%20authenticated&userId=${tokenData.user_id}&nickname=${user.nickname}&email=${user.email}`
 
     return { url: redirectUrl };
   }

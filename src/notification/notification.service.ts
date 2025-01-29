@@ -11,7 +11,9 @@ import { User } from 'src/orders/entities/user.entity';
 import { Order } from 'src/orders/entities/order.entity';
 import { Payment } from 'src/orders/entities/payment.entity';
 import { OrderItem } from 'src/orders/entities/order-item.entity';
-import { AuditService } from './audit.service';
+import { ProductAudit } from './entities/product-audit.entity';
+import { Product } from '../products/entities/product.entity';
+
 
 @Injectable()
 export class NotificationService {
@@ -35,11 +37,14 @@ export class NotificationService {
     private readonly paymentRepository: Repository<Payment>,
     @InjectRepository(OrderItem)
     private readonly orderItemRepository: Repository<OrderItem>,
+    @InjectRepository(ProductAudit)
+    private readonly productAuditRepository: Repository<ProductAudit>,
+    @InjectRepository(Product)
+    private readonly productRepository: Repository<Product>,
 
 
     private readonly httpService: HttpService,
     private configService: ConfigService,
-    private auditService:AuditService,
   ) {
     this.clientId = this.configService.get<string>('CLIENT_ID');
     this.clientSecret = this.configService.get<string>('CLIENT_SECRET');
@@ -93,8 +98,6 @@ export class NotificationService {
 
         await this.saveOrderItems(orderDetails.order_items, order);
         await this.savePayments(orderDetails.payments, order);
-
-        await this.detectAndLogOrderChanges(orderDetails, order);
 
         notification.processed = true;
         await this.notificationRepository.save(notification);
@@ -211,43 +214,93 @@ export class NotificationService {
   }
 
   private async saveOrderItems(orderItems: any[], order: Order): Promise<void> {
-    const items = await Promise.all(orderItems.map(async (itemDetail: any) => {
-      let item = await this.orderItemRepository.createQueryBuilder('orderItem')
-        .where('orderItem.item_id = :itemId', { itemId: itemDetail.item.id })
-        .andWhere('orderItem.orderId = :orderId', { orderId: order.id }).
-        getOne();
+    const items = await Promise.all(
+      orderItems.map(async (itemDetail) => {
+        const { item, quantity, unit_price, full_unit_price, currency_id } = itemDetail;
+        const { id: itemId, title, category_id, condition, warranty, seller_sku } = item;
 
-      if (!item) {
-        item = this.orderItemRepository.create({
-          order: order,
-          item_id: itemDetail.item.id,
-          title: itemDetail.item.title,
-          category_id: itemDetail.item.category_id,
-          quantity: itemDetail.quantity,
-          unit_price: itemDetail.unit_price,
-          full_unit_price: itemDetail.full_unit_price,
-          currency_id: itemDetail.currency_id,
-          condition: itemDetail.item.condition,
-          warranty: itemDetail.item.warranty ?? '',
-          seller_sku:itemDetail.seller_sku,
-        });
-      } else {
-        item.title = itemDetail.item.title;
-        item.category_id = itemDetail.item.category_id;
-        item.quantity = itemDetail.quantity;
-        item.unit_price = itemDetail.unit_price;
-        item.full_unit_price = itemDetail.full_unit_price;
-        item.currency_id = itemDetail.currency_id;
-        item.condition = itemDetail.item.condition;
-        item.warranty = itemDetail.item.warranty ?? '';
-        item.seller_sku = itemDetail.seller_sku;
-      }
+        let orderItem = await this.orderItemRepository.createQueryBuilder('orderItem')
+          .where('orderItem.item_id = :itemId', { itemId: itemDetail.item.id })
+          .andWhere('orderItem.orderId = :orderId', { orderId: order.id })
+          .getOne();
 
-      return item;
-    }));
+        if (!orderItem) {
+          orderItem = this.orderItemRepository.create({
+            order,
+            item_id: itemId,
+            title,
+            category_id,
+            quantity,
+            unit_price,
+            full_unit_price,
+            currency_id,
+            condition,
+            warranty: warranty ?? '',
+            seller_sku,
+          });
+        } else {
+          Object.assign(orderItem, { title, category_id, quantity, unit_price, full_unit_price, currency_id, condition, warranty: warranty ?? '', seller_sku });
+        }
+
+
+        const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id } });
+
+        if (!existingAudit) {
+          await this.handleInventoryAndAudit(order, itemDetail);
+        }
+
+        return orderItem;
+      })
+    );
+
 
     await this.orderItemRepository.save(items);
   }
+
+  private async handleInventoryAndAudit(order: Order, itemDetail: any): Promise<void> {
+    const { item, quantity } = itemDetail;
+    const { seller_sku, id: mlSku } = item;
+    let skuSource: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND';
+    let quantityDiscounted = 0;
+    let errorMessage: string | null = null;
+
+    const product = await this.productRepository.findOne({
+      where: { internal_sku: seller_sku },
+      relations: ['secondarySkus'],
+    });
+
+    if (product && order.logistic_type !== 'fulfillment') {
+      const stockItem = product.secondarySkus[0];
+      if (product.stock >= stockItem.stock_quantity) {
+        product.stock -= stockItem.stock_quantity;
+        quantityDiscounted = stockItem.stock_quantity;
+        skuSource = 'OK_INTERNO';
+      } else {
+        errorMessage = `Stock insuficiente: ${stockItem.stock_quantity}`;
+        skuSource = 'NOT_FOUND';
+      }
+      await this.productRepository.save(product);
+    } else if (product && ['self_service', 'xd_drop_off'].includes(order.logistic_type)) {
+      quantityDiscounted = product.secondarySkus[0].stock_quantity;
+      skuSource = 'OK_FULL';
+    } else {
+      skuSource = 'NOT_FOUND';
+      errorMessage = 'SKU no encontrado en el inventario';
+    }
+
+    const audit = this.productAuditRepository.create({
+      order_id: order.id,
+      internal_sku: seller_sku,
+      secondary_sku: mlSku,
+      status: skuSource,
+      quantity_discounted: quantityDiscounted,
+      error_message: errorMessage,
+      logistic_type: order.logistic_type,
+      platform_name: 'Mercado Libre',
+    });
+    await this.productAuditRepository.save(audit);
+  }
+
 
   private async savePayments(payments: any[], order: Order): Promise<void> {
     const paymentPromises = payments.map(async (paymentDetail: any) => {
@@ -285,13 +338,6 @@ export class NotificationService {
     await this.paymentRepository.save(await Promise.all(paymentPromises));
   }
 
-  private async detectAndLogOrderChanges(oldOrder: Order, newOrder: Order): Promise<void> {
-    // Esperamos que detectChanges termine antes de continuar.
-    const orderChanges = await this.detectChanges(oldOrder, newOrder);
-
-    // Logueamos el cambio de la orden.
-    await this.auditService.logAudit('order: ' + newOrder.id, 'update', { order: orderChanges });
-  }
 
 
 
@@ -421,129 +467,6 @@ export class NotificationService {
     }
   }
 
-  async detectChanges(oldEntity: any, newEntity: any): Promise<EntityChanges> {
-    const changes: EntityChanges = {};
-
-    // Define propiedades que no quieres comparar
-    const excludedProperties = ['someExcludedProperty', 'anotherExcludedProperty'];
-
-    for (let key in newEntity) {
-      // Omitir propiedades excluidas
-      if (excludedProperties.includes(key)) {
-        continue;
-      }
-
-      const oldValue = oldEntity[key];
-      const newValue = newEntity[key];
-
-      // Verificar si ambos valores son objetos
-      if (this.isObject(newValue) && this.isObject(oldValue)) {
-        if (!this.deepEqual(oldValue, newValue)) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
-      // Verificar si ambos valores son arrays
-      else if (Array.isArray(newValue) && Array.isArray(oldValue)) {
-        if (!this.deepEqual(oldValue, newValue)) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
-      // Comparar fechas, teniendo en cuenta las zonas horarias
-      else if (newValue instanceof Date && oldValue instanceof Date) {
-        if (this.areDatesDifferent(oldValue, newValue)) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue.toISOString(),
-            newValue: newValue.toISOString(),
-          };
-        }
-      }
-      // Comparar valores booleanos
-      else if (typeof newValue === 'boolean' && typeof oldValue === 'boolean') {
-        if (newValue !== oldValue) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
-      // Comparación de valores numéricos (montos)
-      else if (typeof newValue === 'number' && typeof oldValue === 'number') {
-        if (newValue !== oldValue) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
-      // Comparación de valores representados como cadenas numéricas
-      else if ((typeof newValue === 'string' || typeof oldValue === 'string') && !isNaN(parseFloat(newValue))) {
-        const oldAmount = parseFloat(oldValue);
-        const newAmount = parseFloat(newValue);
-        if (oldAmount !== newAmount) {
-          changes[key] = {
-            column: key,
-            oldValue: oldAmount,
-            newValue: newAmount,
-          };
-        }
-      }
-      // Comparación de valores normales
-      else if (newValue !== oldValue) {
-        if (newValue !== null && oldValue !== null && newValue !== undefined && oldValue !== undefined) {
-          changes[key] = {
-            column: key,
-            oldValue: oldValue,
-            newValue: newValue,
-          };
-        }
-      }
-    }
-
-    return changes;
-  }
-
-// Función para verificar si el valor es un objeto
-  private isObject(value: any): boolean {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
-  }
-
-// Función para comparar objetos y arrays de manera profunda
-  private deepEqual(a: any, b: any): boolean {
-    if (a === b) return true;
-
-    if (this.isObject(a) && this.isObject(b)) {
-      const keysA = Object.keys(a);
-      const keysB = Object.keys(b);
-
-      if (keysA.length !== keysB.length) return false;
-
-      return keysA.every((key) => this.deepEqual(a[key], b[key]));
-    }
-
-    if (Array.isArray(a) && Array.isArray(b)) {
-      if (a.length !== b.length) return false;
-      return a.every((item, index) => this.deepEqual(item, b[index]));
-    }
-
-    return false;
-  }
-
-// Función para comparar fechas de manera robusta, teniendo en cuenta las zonas horarias
-  private areDatesDifferent(oldDate: Date, newDate: Date): boolean {
-    // Compara las fechas en formato ISO, que es independiente de la zona horaria
-    return oldDate.toISOString() !== newDate.toISOString();
-  }
 
 
 

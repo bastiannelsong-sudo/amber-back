@@ -17,7 +17,12 @@ export class ProductsService {
   }
 
   findAll() {
-    return this.productRepository.find({ relations: ['secondarySkus','category'] });
+    return this.productRepository
+      .createQueryBuilder('product')
+      .leftJoinAndSelect('product.secondarySkus', 'secondarySkus') // Left join para incluir incluso cuando secondarySkus es null
+      .leftJoinAndSelect('product.category', 'category')
+      .orderBy('product.product_id', 'ASC')
+      .getMany(); // Obtiene todos los productos
   }
 
   findOne(id: number) {

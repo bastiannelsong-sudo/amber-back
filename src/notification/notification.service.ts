@@ -265,7 +265,10 @@ export class NotificationService {
     let errorMessage: string | null = null;
 
     const product = await this.productRepository.findOne({
-      where: { internal_sku: seller_sku },
+      where: [
+        { internal_sku: seller_sku },
+        { internal_sku: mlSku }
+      ],
       relations: ['secondarySkus'],
     });
 
@@ -280,7 +283,7 @@ export class NotificationService {
         skuSource = 'NOT_FOUND';
       }
       await this.productRepository.save(product);
-    } else if (product && ['self_service', 'xd_drop_off'].includes(order.logistic_type)) {
+    } else if (product && order.logistic_type === 'fulfillment') {
       quantityDiscounted = product.secondarySkus[0].stock_quantity;
       skuSource = 'OK_FULL';
     } else {

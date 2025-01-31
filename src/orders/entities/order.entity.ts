@@ -9,7 +9,7 @@ export class Order {
   id: number; // Cambiar BigInt a number en TypeScript
 
   @Column()
-  date_created: Date;
+  date_approved:Date;
 
   @Column()
   last_updated: Date;

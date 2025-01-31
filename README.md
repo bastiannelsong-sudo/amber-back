@@ -97,3 +97,12 @@ Nest is an MIT-licensed open source project. It can grow thanks to the sponsors 
 ## License
 
 Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+
+
+## Querys
+
+SELECT  p.*, o.logistic_type,o.date_created
+FROM public.product_audits p
+inner join "order"  o on
+o.id = p.order_id where  p.created_at between '2025-01-29 00:00:00.00000' and '2025-01-31 00:00:00.00000'
+order by p.audit_id desc

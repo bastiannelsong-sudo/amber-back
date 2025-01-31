@@ -21,6 +21,7 @@ export class NotificationService {
   private readonly clientSecret: string;
   private readonly apiUrl: string;
 
+
   private refreshAttemptCount: number = 0;
 
   constructor(
@@ -45,6 +46,7 @@ export class NotificationService {
 
     private readonly httpService: HttpService,
     private configService: ConfigService,
+
   ) {
     this.clientId = this.configService.get<string>('CLIENT_ID');
     this.clientSecret = this.configService.get<string>('CLIENT_SECRET');
@@ -79,17 +81,39 @@ export class NotificationService {
 
 
   async handleNotificationAsync(notification: Notification): Promise<void> {
-    try {
-      if (notification.processed) {
-        console.log('Notificación ya procesada, se omite...');
-        return;
-      }
+            try {
+              if (notification.processed) {
+            console.log('Notificación ya procesada, se omite...');
+            return;
+          }
 
-      console.log('Evento recibido:', notification);
+          console.log('Evento recibido:', notification);
 
-      if (notification.topic.trim().toLowerCase() === 'orders_v2') {
-        const orderDetails = await this.getOrderDetails(notification);
-        if (orderDetails.error) return;
+          if (notification.topic.trim().toLowerCase() === 'orders_v2') {
+            const orderDetails = await this.getOrderDetails(notification);
+
+            const approvedPayments = orderDetails.payments.filter(payment => payment.status === "approved");
+
+            if (approvedPayments.length === 0) {
+              console.log('No hay pagos aprobados. No se procesará la orden.');
+          return;
+        }
+            orderDetails.date_approved = approvedPayments[0].date_approved;
+
+
+            const approvedDate = new Date(approvedPayments[0].date_approved);
+            const minApprovedDate = new Date(process.env.MIN_APPROVED_DATE || '');
+
+
+            if (isNaN(minApprovedDate.getTime())) {
+              console.error('Error: MIN_APPROVED_DATE no está bien definida en el .env');
+              return;
+            }
+
+            if (approvedDate.getTime() < minApprovedDate.getTime()) {
+              console.log(`La fecha de aprobación (${approvedDate}) es menor a la mínima permitida (${minApprovedDate}), se omite la orden.`);
+              return;
+            }
 
         await this.saveBuyer(orderDetails.buyer);
         await this.saveSeller(orderDetails.seller);
@@ -151,7 +175,7 @@ export class NotificationService {
       // Si la orden no existe, se crea una nueva
       order = this.orderRepository.create({
         id: orderDetails.id,
-        date_created: new Date(orderDetails.date_created),
+        date_approved: new Date(orderDetails.date_approved),
         last_updated: new Date(orderDetails.last_updated),
         expiration_date: orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null,
         date_closed: orderDetails.date_closed ? new Date(orderDetails.date_closed) : null,
@@ -179,7 +203,7 @@ export class NotificationService {
       }
     } else {
 
-      order.date_created = new Date(orderDetails.date_created);
+      order.date_approved = new Date(orderDetails.date_approved);
       order.last_updated = new Date(orderDetails.last_updated);
       order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
       order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
@@ -275,11 +299,11 @@ export class NotificationService {
     if (product && order.logistic_type !== 'fulfillment') {
       const stockItem = product.secondarySkus[0];
       if (product.stock >= stockItem.stock_quantity) {
-        product.stock -= stockItem.stock_quantity;
-        quantityDiscounted = stockItem.stock_quantity;
+        product.stock -= (stockItem.stock_quantity * itemDetail.quantity);
+        quantityDiscounted = (stockItem.stock_quantity * itemDetail.quantity);
         skuSource = 'OK_INTERNO';
       } else {
-        errorMessage = `Stock insuficiente: ${stockItem.stock_quantity}`;
+        errorMessage = `Stock insuficiente: ${(stockItem.stock_quantity * itemDetail.quantity)}`;
         skuSource = 'NOT_FOUND';
       }
       await this.productRepository.save(product);
@@ -384,14 +408,14 @@ export class NotificationService {
   private async getLogisticType(order: Order): Promise<string> {
     let session: Session | null = null;
     try {
-      // Buscar la sesión activa para el usuario asociado a la orden
-      session = await this.sessionRepository.findOne({
+
+       session = await this.sessionRepository.findOne({
         where: { user_id: order.seller.id  },
       });
 
       if (!session) {
         console.log('No se encontró sesión activa para la orden:', order.seller.id);
-        return 'Unknown'; // Si no se encuentra la sesión, devolvemos un valor por defecto
+        return 'Unknown';
       }
 
       

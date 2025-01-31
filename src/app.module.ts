@@ -19,6 +19,7 @@ import { Platform } from './products/entities/platform.entity';
 import { SecondarySku } from './products/entities/secondary-sku.entity';
 import { Category } from './products/entities/category.entity';
 import { ProductAudit } from './notification/entities/product-audit.entity';
+import { MercadoLibreModule } from './mercadolibre/mercadolibre.module';
 
 @Module({
   imports: [
@@ -45,7 +46,8 @@ import { ProductAudit } from './notification/entities/product-audit.entity';
     AuthModule,
     NotificationModule,
     HttpModule,
-    ProductsModule
+    ProductsModule,
+    MercadoLibreModule
 
   ],
   controllers: [NotificationController],

@@ -81,56 +81,88 @@ export class NotificationService {
 
 
   async handleNotificationAsync(notification: Notification): Promise<void> {
-            try {
-              if (notification.processed) {
-            console.log('Notificación ya procesada, se omite...');
-            return;
-          }
+    try {
+      if (this.isNotificationProcessed(notification)) return;
 
-          console.log('Evento recibido:', notification);
+      console.log('Evento recibido:', notification);
 
-          if (notification.topic.trim().toLowerCase() === 'orders_v2') {
-            const orderDetails = await this.getOrderDetails(notification);
+      if (!this.isOrderNotification(notification)) return;
 
-            const approvedPayments = orderDetails.payments.filter(payment => payment.status === "approved");
+      const orderDetails = await this.getOrderDetails(notification);
+      if (!this.shouldProcessOrder(orderDetails)) return;
 
-            if (approvedPayments.length === 0) {
-              console.log('No hay pagos aprobados. No se procesará la orden.');
-          return;
-        }
-            orderDetails.date_approved = approvedPayments[0].date_approved;
+      await this.processOrder(orderDetails);
 
+      notification.processed = true;
+      await this.notificationRepository.save(notification);
 
-            const approvedDate = new Date(approvedPayments[0].date_approved);
-            const minApprovedDate = new Date(process.env.MIN_APPROVED_DATE || '');
-
-
-            if (isNaN(minApprovedDate.getTime())) {
-              console.error('Error: MIN_APPROVED_DATE no está bien definida en el .env');
-              return;
-            }
-
-            if (approvedDate.getTime() < minApprovedDate.getTime()) {
-              console.log(`La fecha de aprobación (${approvedDate}) es menor a la mínima permitida (${minApprovedDate}), se omite la orden.`);
-              return;
-            }
-
-        await this.saveBuyer(orderDetails.buyer);
-        await this.saveSeller(orderDetails.seller);
-
-        const order = await this.saveOrder(orderDetails);
-
-        await this.saveOrderItems(orderDetails.order_items, order);
-        await this.savePayments(orderDetails.payments, order);
-
-        notification.processed = true;
-        await this.notificationRepository.save(notification);
-
-        console.log('Orden y detalles guardados correctamente.');
-      }
+      console.log('Orden y detalles guardados correctamente.');
     } catch (error) {
       console.error('Error durante el procesamiento de la notificación:', error);
     }
+  }
+
+
+  private isNotificationProcessed(notification: Notification): boolean {
+    if (notification.processed) {
+      console.log('Notificación ya procesada, se omite...');
+      return true;
+    }
+    return false;
+  }
+
+
+  private isOrderNotification(notification: Notification): boolean {
+    return notification.topic.trim().toLowerCase() === 'orders_v2';
+  }
+
+
+  private shouldProcessOrder(orderDetails: any): boolean {
+    const approvedPayments = orderDetails.payments.filter(
+      payment => payment.status === 'approved'
+    );
+
+    if (approvedPayments.length === 0) {
+      if (orderDetails.status === 'cancelled') {
+        console.log('Seguir para revisar inventario.');
+        return true;
+      } else {
+        console.log('No hay pagos aprobados. No se procesará la orden.');
+        return false;
+      }
+    }
+
+    return this.isApprovedDateValid(approvedPayments[0].date_approved);
+  }
+
+// ✅ Valida la fecha de aprobación del pago
+  private isApprovedDateValid(dateApproved: string): boolean {
+    const approvedDate = new Date(dateApproved);
+    const minApprovedDate = new Date(process.env.MIN_APPROVED_DATE || '');
+
+    if (isNaN(minApprovedDate.getTime())) {
+      console.error('Error: MIN_APPROVED_DATE no está bien definida en el .env');
+      return false;
+    }
+
+    if (approvedDate.getTime() < minApprovedDate.getTime()) {
+      console.log(
+        `La fecha de aprobación (${approvedDate}) es menor a la mínima permitida (${minApprovedDate}), se omite la orden.`
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  private async processOrder(orderDetails: any): Promise<void> {
+    await this.saveBuyer(orderDetails.buyer);
+    await this.saveSeller(orderDetails.seller);
+
+    const order = await this.saveOrder(orderDetails);
+
+    await this.saveOrderItems(orderDetails.order_items, order);
+    await this.savePayments(orderDetails.payments, order);
   }
 
   private async saveBuyer(buyerDetails: any): Promise<void> {
@@ -175,7 +207,7 @@ export class NotificationService {
       // Si la orden no existe, se crea una nueva
       order = this.orderRepository.create({
         id: orderDetails.id,
-        date_approved: new Date(orderDetails.date_approved),
+        date_approved : new Date(orderDetails.date_approved ?? orderDetails.date_created),
         last_updated: new Date(orderDetails.last_updated),
         expiration_date: orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null,
         date_closed: orderDetails.date_closed ? new Date(orderDetails.date_closed) : null,
@@ -203,7 +235,8 @@ export class NotificationService {
       }
     } else {
 
-      order.date_approved = new Date(orderDetails.date_approved);
+      order.date_approved = new Date(orderDetails.date_approved ?? orderDetails.date_created);
+
       order.last_updated = new Date(orderDetails.last_updated);
       order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
       order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
@@ -266,12 +299,24 @@ export class NotificationService {
           Object.assign(orderItem, { title, category_id, quantity, unit_price, full_unit_price, currency_id, condition, warranty: warranty ?? '', seller_sku });
         }
 
+        if(order.status === 'cancelled') {
+          const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id, status: 'CANCELLED' } });
 
-        const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id } });
+          if(!existingAudit){
+            if (!existingAudit || (existingAudit && order.status === 'cancelled' && order.logistic_type !== 'fulfillment' && existingAudit.status !== 'CANCELLED')) {
+              await this.handleInventoryAndAudit(order, itemDetail);
+            }
+          }
 
-        if (!existingAudit) {
-          await this.handleInventoryAndAudit(order, itemDetail);
         }
+        else{
+          const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id } });
+
+          if (!existingAudit) {
+            await this.handleInventoryAndAudit(order, itemDetail);
+          }
+        }
+
 
         return orderItem;
       })
@@ -284,49 +329,75 @@ export class NotificationService {
   private async handleInventoryAndAudit(order: Order, itemDetail: any): Promise<void> {
     const { item, quantity } = itemDetail;
     const { seller_sku, id: mlSku } = item;
-    let skuSource: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND';
-    let quantityDiscounted = 0;
-    let errorMessage: string | null = null;
 
-    const product = await this.productRepository.findOne({
-      where: [
-        { internal_sku: seller_sku },
-        { internal_sku: mlSku }
-      ],
-      relations: ['secondarySkus'],
-    });
-
-    if (product && order.logistic_type !== 'fulfillment') {
-      const stockItem = product.secondarySkus[0];
-      if (product.stock >= stockItem.stock_quantity) {
-        product.stock -= (stockItem.stock_quantity * itemDetail.quantity);
-        quantityDiscounted = (stockItem.stock_quantity * itemDetail.quantity);
-        skuSource = 'OK_INTERNO';
-      } else {
-        errorMessage = `Stock insuficiente: ${(stockItem.stock_quantity * itemDetail.quantity)}`;
-        skuSource = 'NOT_FOUND';
-      }
-      await this.productRepository.save(product);
-    } else if (product && order.logistic_type === 'fulfillment') {
-      quantityDiscounted = product.secondarySkus[0].stock_quantity;
-      skuSource = 'OK_FULL';
-    } else {
-      skuSource = 'NOT_FOUND';
-      errorMessage = 'SKU no encontrado en el inventario';
+    const product = await this.findProduct(seller_sku, mlSku);
+    if (!product) {
+      return this.createAudit(order, seller_sku, mlSku, 'NOT_FOUND', 0, 'SKU no encontrado en el inventario');
     }
 
+    if (order.logistic_type === 'fulfillment') {
+      return this.createAudit(order, seller_sku, mlSku, 'OK_FULL', product.secondarySkus[0].stock_quantity);
+    }
+
+    const { quantityDiscounted, status, errorMessage } = this.processStockUpdate(order, product, quantity);
+    await this.productRepository.save(product);
+    await this.createAudit(order, seller_sku, mlSku, status, quantityDiscounted, errorMessage);
+  }
+
+  private async findProduct(seller_sku: string, mlSku: string): Promise<Product | null> {
+    return this.productRepository.findOne({
+      where: [{ internal_sku: seller_sku }, { internal_sku: mlSku }],
+      relations: ['secondarySkus'],
+    });
+  }
+
+  private processStockUpdate(
+    order: Order,
+    product: Product,
+    quantity: number
+  ): { quantityDiscounted: number; status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND' | 'CANCELLED'; errorMessage?: string } {
+    const stockItem = product.secondarySkus[0];
+
+    if (order.status === 'cancelled') {
+      product.stock += stockItem.stock_quantity * quantity;
+      return { quantityDiscounted: -(stockItem.stock_quantity * quantity), status: 'CANCELLED' };
+    }
+
+    if (product.stock >= stockItem.stock_quantity * quantity) {
+      product.stock -= stockItem.stock_quantity * quantity;
+      return { quantityDiscounted: stockItem.stock_quantity * quantity, status: 'OK_INTERNO' };
+    }
+
+    return {
+      quantityDiscounted: 0,
+      status: 'NOT_FOUND',
+      errorMessage: `Stock insuficiente: ${stockItem.stock_quantity * quantity}`,
+    };
+  }
+
+
+  private async createAudit(
+    order: Order,
+    seller_sku: string,
+    mlSku: string,
+    status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND' | 'CANCELLED',
+    quantityDiscounted: number,
+    errorMessage?: string
+  ): Promise<void> {
     const audit = this.productAuditRepository.create({
       order_id: order.id,
       internal_sku: seller_sku,
       secondary_sku: mlSku,
-      status: skuSource,
+      status:status,
       quantity_discounted: quantityDiscounted,
-      error_message: errorMessage,
+      error_message: errorMessage || null,
       logistic_type: order.logistic_type,
       platform_name: 'Mercado Libre',
     });
+
     await this.productAuditRepository.save(audit);
   }
+
 
 
   private async savePayments(payments: any[], order: Order): Promise<void> {

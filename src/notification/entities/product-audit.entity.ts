@@ -29,6 +29,6 @@ export class ProductAudit {
   @CreateDateColumn()
   created_at: Date;
 
-  @Column({ type: 'enum', enum: ['OK_INTERNO', 'OK_FULL', 'NOT_FOUND'] })
-  status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND';
+  @Column({ type: 'enum', enum: ['OK_INTERNO', 'OK_FULL', 'NOT_FOUND','CANCELLED'] })
+  status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND' | 'CANCELLED';
 }

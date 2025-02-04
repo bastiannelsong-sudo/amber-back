@@ -16,7 +16,12 @@ export class Product {
   @Column({ type: 'int' })
   stock: number;
 
-  @OneToMany(() => SecondarySku, (secondarySku) => secondarySku.product)
+
+  @OneToMany(
+    () => SecondarySku,
+    (secondarySku) => secondarySku.product,
+    { cascade: true }
+  )
   secondarySkus: SecondarySku[];
 
   @ManyToOne(() => Category, { onDelete: 'CASCADE' })

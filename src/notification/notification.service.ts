@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Notification } from './entities/notification.entity';
 import { HttpService } from '@nestjs/axios';
 import { AxiosResponse } from 'axios';
@@ -299,15 +299,17 @@ export class NotificationService {
           Object.assign(orderItem, { title, category_id, quantity, unit_price, full_unit_price, currency_id, condition, warranty: warranty ?? '', seller_sku });
         }
 
-        if(order.status === 'cancelled') {
-          const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id, status: 'CANCELLED' } });
-
-          if(!existingAudit){
-            if (!existingAudit || (existingAudit && order.status === 'cancelled' && order.logistic_type !== 'fulfillment' && existingAudit.status !== 'CANCELLED')) {
-              await this.handleInventoryAndAudit(order, itemDetail);
+        if (order.status === 'cancelled') {
+          const existingAudit = await this.productAuditRepository.findOne({
+            where: {
+              order_id: order.id,
+              status: In(['OK_INTERNO'])
             }
-          }
+          });
 
+          if (existingAudit) {
+            await this.handleInventoryAndAudit(order, itemDetail);
+          }
         }
         else{
           const existingAudit = await this.productAuditRepository.findOne({ where: { order_id: order.id } });

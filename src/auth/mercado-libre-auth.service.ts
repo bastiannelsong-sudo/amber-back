@@ -37,16 +37,19 @@ export class MercadoLibreAuthService {
 
   async exchangeCodeForToken(code: string): Promise<any> {
     try {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'authorization_code');
+      params.append('client_id', this.clientId);
+      params.append('client_secret', this.clientSecret);
+      params.append('code', code);
+      params.append('redirect_uri', this.redirectUri);
+
+      this.logger.log(`Exchanging code for token with redirect_uri: ${this.redirectUri}`);
+
       const response = await lastValueFrom(
         this.httpService.post(
           this.tokenUrl,
-          {
-            grant_type: 'authorization_code',
-            client_id: this.clientId,
-            client_secret: this.clientSecret,
-            code,
-            redirect_uri: this.redirectUri,
-          },
+          params.toString(),
           { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
         ),
       );
@@ -55,7 +58,11 @@ export class MercadoLibreAuthService {
 
       return response.data;
     } catch (error) {
-      throw new HttpException('Error exchanging code for token', 500);
+      this.logger.error('Error exchanging code for token:', error.response?.data || error.message);
+      throw new HttpException(
+        error.response?.data?.message || 'Error exchanging code for token',
+        error.response?.status || 500,
+      );
     }
   }
 

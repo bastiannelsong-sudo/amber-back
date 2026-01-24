@@ -96,6 +96,26 @@ export class OrderService {
   }
 
   /**
+   * Find orders by pack_id for a specific seller
+   * Used to debug/find orders that are grouped in a pack
+   */
+  async findByPackId(packId: number, sellerId: number): Promise<Order[]> {
+    this.logger.debug(`Fetching orders with pack_id ${packId} for seller ${sellerId}`);
+
+    const orders = await this.orderRepository.find({
+      where: {
+        seller: { id: sellerId },
+        pack_id: packId,
+      },
+      relations: ['buyer', 'items', 'payments'],
+      order: { date_approved: 'DESC' },
+    });
+
+    this.logger.debug(`Found ${orders.length} orders with pack_id ${packId}`);
+    return orders;
+  }
+
+  /**
    * Get daily sales with complete metrics
    * Groups orders by logistic type and calculates financial metrics
    *
@@ -133,17 +153,17 @@ export class OrderService {
       type === 'cross_docking' || type === 'self_service' ||
       type === 'cross_docking_cost' || type === 'self_service_cost';
 
-    // Filter out cancelled orders - they shouldn't count in sales metrics
-    const activeOrders = orderSummaries.filter((o) => o.status !== 'cancelled');
-
+    // Include ALL orders (including cancelled) in classification
+    // Cancelled orders count for SII reporting but are excluded from financial sums
+    // The calculateLogisticTypeSummary method handles excluding cancelled orders from sums
     const classified = {
-      fulfillment: activeOrders.filter(
+      fulfillment: orderSummaries.filter(
         (o) => o.logistic_type === 'fulfillment',
       ),
-      cross_docking: activeOrders.filter(
+      cross_docking: orderSummaries.filter(
         (o) => isFlexType(o.logistic_type),
       ),
-      other: activeOrders.filter(
+      other: orderSummaries.filter(
         (o) =>
           o.logistic_type !== 'fulfillment' &&
           !isFlexType(o.logistic_type),
@@ -240,6 +260,11 @@ export class OrderService {
     const shippingBonus = payment ? Number(payment.shipping_bonus) || 0 : 0; // Bonificación de ML
     const courierCost = payment ? Number(payment.courier_cost) || 0 : 0; // Costo externo courier
 
+    // Check if order is cancelled OR payment is in mediation (return/dispute in progress)
+    // Both cases mean money is not available and shouldn't count towards profits
+    const isCancelledOrUnavailable =
+      order.status === 'cancelled' || payment?.status === 'in_mediation';
+
     // Add external flex shipping cost to total fees for all Flex orders
     const externalFlexCost = isAnyFlexOrder ? flexCostPerOrder : 0;
 
@@ -260,6 +285,7 @@ export class OrderService {
       date_created: order.date_approved,
       date_approved: order.date_approved,
       status: order.status,
+      is_cancelled: isCancelledOrUnavailable, // Cancelled OR in_mediation (return/dispute) - money not available
       total_amount: grossAmount,
       paid_amount: Number(order.paid_amount) || 0,
       logistic_type: order.logistic_type || 'other',
@@ -307,9 +333,13 @@ export class OrderService {
     logisticType: string,
     label: string,
   ): LogisticTypeSummaryDto {
-    // Filter out cancelled orders for metric calculations
-    const activeOrders = orders.filter((o) => o.status !== 'cancelled');
-    const totalOrders = activeOrders.length;
+    // Count ALL orders (including cancelled) for SII reporting
+    const totalOrders = orders.length;
+
+    // Filter out cancelled/in_mediation orders for FINANCIAL calculations only
+    // These orders are shown in the list but don't affect sums (money not available)
+    const activeOrders = orders.filter((o) => !o.is_cancelled);
+    const activeOrderCount = activeOrders.length;
 
     if (totalOrders === 0) {
       return {
@@ -330,7 +360,7 @@ export class OrderService {
       };
     }
 
-    // Single pass aggregation (only active orders)
+    // Single pass aggregation (only active orders for financial metrics)
     // Use order.total_fees which already has correct logic (Flex shipping is not a cost)
     const totals = activeOrders.reduce(
       (acc, order) => ({
@@ -351,7 +381,7 @@ export class OrderService {
     return {
       logistic_type: logisticType,
       logistic_type_label: label,
-      total_orders: totalOrders,
+      total_orders: totalOrders, // Includes cancelled (for SII count)
       total_items: totals.items,
       gross_amount: totals.gross,
       shipping_cost: totals.shipping, // For reference only (Flex = income, not cost)
@@ -361,8 +391,9 @@ export class OrderService {
       flex_shipping_cost: totals.flexShipping,
       total_fees: totals.totalFees, // Use pre-calculated total that respects Flex logic
       net_profit: totals.profit,
-      average_order_value: totals.gross / totalOrders,
-      average_profit_margin: totals.margin / totalOrders,
+      // Use activeOrderCount for averages (exclude cancelled from average calculations)
+      average_order_value: activeOrderCount > 0 ? totals.gross / activeOrderCount : 0,
+      average_profit_margin: activeOrderCount > 0 ? totals.margin / activeOrderCount : 0,
     };
   }
 
@@ -415,6 +446,42 @@ export class OrderService {
    * - db-use-transactions: Uses transaction for batch inserts
    * - error-handle-async-errors: Proper error handling
    */
+  /**
+   * Process orders in parallel batches for faster sync
+   * @param orders - Array of orders to process
+   * @param sellerId - Seller ID
+   * @param batchSize - Number of orders to process in parallel (default 10)
+   */
+  private async processOrdersInBatches(
+    orders: any[],
+    sellerId: number,
+    batchSize = 10,
+  ): Promise<number> {
+    let syncedCount = 0;
+
+    // Split orders into batches
+    for (let i = 0; i < orders.length; i += batchSize) {
+      const batch = orders.slice(i, i + batchSize);
+      this.logger.log(`Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(orders.length / batchSize)} (${batch.length} orders)`);
+
+      // Process batch in parallel
+      const results = await Promise.allSettled(
+        batch.map((mlOrder) => this.saveOrderFromMercadoLibre(mlOrder, sellerId)),
+      );
+
+      // Count successful syncs
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          syncedCount++;
+        } else {
+          this.logger.warn(`Failed to save order: ${result.reason?.message}`);
+        }
+      }
+    }
+
+    return syncedCount;
+  }
+
   async syncFromMercadoLibre(
     date: string,
     sellerId: number,
@@ -431,18 +498,8 @@ export class OrderService {
       const orders = (mlResponse as any)?.results || mlResponse || [];
       this.logger.log(`Received ${orders.length} orders from Mercado Libre`);
 
-      let syncedCount = 0;
-
-      for (const mlOrder of orders) {
-        try {
-          await this.saveOrderFromMercadoLibre(mlOrder, sellerId);
-          syncedCount++;
-        } catch (error) {
-          this.logger.warn(
-            `Failed to save order ${mlOrder.id}: ${error.message}`,
-          );
-        }
-      }
+      // Process orders in parallel batches (10 at a time to avoid rate limits)
+      const syncedCount = await this.processOrdersInBatches(orders, sellerId, 10);
 
       this.logger.log(`Successfully synced ${syncedCount} orders`);
 
@@ -522,7 +579,14 @@ export class OrderService {
     // Fetch shipment data if we have a shipping_id
     if (mlOrder.shipping?.id) {
       console.log(`[Sync] Fetching shipment for order ${mlOrder.id}...`);
-      const shipmentData = await this.mercadoLibreService.getOrderShipment(mlOrder.id, sellerId);
+      let shipmentData = await this.mercadoLibreService.getOrderShipment(mlOrder.id, sellerId);
+
+      // FALLBACK: For cancelled orders, getOrderShipment may return null
+      // In that case, try getShipmentById directly with the shipping_id
+      if (!shipmentData && mlOrder.shipping?.id) {
+        console.log(`[Sync] getOrderShipment returned null, trying getShipmentById for ${mlOrder.shipping.id}...`);
+        shipmentData = await this.mercadoLibreService.getShipmentById(mlOrder.shipping.id, sellerId);
+      }
 
       // Log full shipment response to find where cost is stored
       console.log(`[Sync] FULL Shipment response for ${mlOrder.id}:`, JSON.stringify(shipmentData, null, 2));
@@ -532,8 +596,10 @@ export class OrderService {
         console.log(`[Sync] Got logistic_type from shipment API: ${logisticType}`);
       }
 
+      // Use the correct shipment ID for fetching costs
+      const shipmentId = shipmentData?.id || mlOrder.shipping?.id;
       // Fetch shipment costs for all order types to get accurate seller costs
-      const shipmentCostsData = await this.mercadoLibreService.getShipmentCosts(shipmentData?.id, sellerId);
+      const shipmentCostsData = await this.mercadoLibreService.getShipmentCosts(shipmentId, sellerId);
       console.log(`[Sync] Shipment costs response:`, JSON.stringify(shipmentCostsData, null, 2));
 
       // Get receiver (buyer) and sender (seller) costs from shipment_costs API

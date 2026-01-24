@@ -43,17 +43,50 @@ export class MercadoLibreService {
 
       const fromDate = `${date}T00:00:00.000-04:00`;
       const toDate = `${date}T23:59:59.999-04:00`;
-      const url = `${this.BASE_URL}?seller=${sellerId}&order.date_created.from=${fromDate}&order.date_created.to=${toDate}`;
 
-      const response = await firstValueFrom(
-        this.httpService.get(url, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-          },
-        })
-      );
+      // Fetch ALL orders using pagination
+      // We need to fetch both paid AND cancelled orders separately
+      // ML API defaults to only returning 'paid' status orders
+      const allOrders: any[] = [];
 
-      return response.data;
+      // Fetch orders for each status we care about
+      const statusesToFetch = ['paid', 'cancelled'];
+
+      for (const status of statusesToFetch) {
+        let offset = 0;
+        const limit = 50; // ML API max per page
+        let totalOrders = 0;
+
+        do {
+          const url = `${this.BASE_URL}?seller=${sellerId}&order.date_created.from=${fromDate}&order.date_created.to=${toDate}&order.status=${status}&offset=${offset}&limit=${limit}`;
+          console.log(`[MercadoLibreService] Fetching ${status} orders page: offset=${offset}, limit=${limit}`);
+
+          const response = await firstValueFrom(
+            this.httpService.get(url, {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+              },
+            })
+          );
+
+          const data = response.data;
+          totalOrders = data.paging?.total || 0;
+          const results = data.results || [];
+
+          allOrders.push(...results);
+          console.log(`[MercadoLibreService] Fetched ${results.length} ${status} orders (total so far: ${allOrders.length})`);
+
+          offset += limit;
+        } while (offset < totalOrders);
+      }
+
+      console.log(`[MercadoLibreService] Total orders fetched for ${date}: ${allOrders.length}`);
+
+      // Return in the same format as before, but with all orders
+      return {
+        paging: { total: allOrders.length, offset: 0, limit: allOrders.length },
+        results: allOrders,
+      } as any;
     } catch (error) {
       if (error.response?.status === 401) {
         console.log('401: El token ha expirado. Intentando hacer refresh...');
@@ -337,5 +370,86 @@ export class MercadoLibreService {
     }
 
     return 0;
+  }
+
+  /**
+   * Get pack information from ML API
+   * Packs group multiple orders together (when buyer purchases multiple products)
+   * Returns the orders contained in the pack
+   */
+  async getPackInfo(packId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/packs/${packId}`;
+      console.log(`[MercadoLibreService] Fetching pack info: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Pack info response:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching pack ${packId}:`, error.message);
+      // Return error details for debugging
+      return {
+        error: true,
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      };
+    }
+  }
+
+  /**
+   * Search orders by pack_id
+   * Uses the orders search endpoint with pack filter
+   */
+  async getOrdersByPackId(packId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      // Search for orders with this pack_id
+      const url = `${this.apiUrl}/orders/search?seller=${sellerId}&pack_id=${packId}`;
+      console.log(`[MercadoLibreService] Searching orders by pack_id: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Orders by pack_id response:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error searching orders by pack ${packId}:`, error.message);
+      return {
+        error: true,
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      };
+    }
   }
 }

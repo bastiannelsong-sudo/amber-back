@@ -118,4 +118,46 @@ export class OrderController {
       shipment_costs: shipmentCosts,
     };
   }
+
+  /**
+   * Debug endpoint to fetch pack information from ML API
+   * GET /orders/debug-pack?pack_id=123&seller_id=456
+   *
+   * MercadoLibre shows "Venta #" which is often a pack_id, not an order_id
+   * This helps find the actual order_id(s) contained in a pack
+   */
+  @Get('debug-pack')
+  async debugMlPack(
+    @Query('pack_id') packId: string,
+    @Query('seller_id') sellerId: string,
+  ): Promise<any> {
+    const packIdNum = parseInt(packId, 10);
+    const sellerIdNum = parseInt(sellerId, 10);
+
+    if (!packIdNum || !sellerIdNum) {
+      throw new BadRequestException('Se requiere pack_id y seller_id');
+    }
+
+    // Try to get pack info directly
+    const packInfo = await this.mercadoLibreService.getPackInfo(packIdNum, sellerIdNum);
+
+    // Also search for orders with this pack_id
+    const ordersByPack = await this.mercadoLibreService.getOrdersByPackId(packIdNum, sellerIdNum);
+
+    // Check if we have this order in our local database
+    const localOrders = await this.orderService.findByPackId(packIdNum, sellerIdNum);
+
+    return {
+      pack_id: packIdNum,
+      seller_id: sellerIdNum,
+      pack_info: packInfo,
+      orders_by_pack: ordersByPack,
+      local_orders: localOrders,
+      summary: {
+        pack_found: !packInfo?.error,
+        orders_in_ml: ordersByPack?.results?.length || 0,
+        orders_in_local_db: localOrders?.length || 0,
+      },
+    };
+  }
 }

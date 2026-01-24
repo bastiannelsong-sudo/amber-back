@@ -42,7 +42,7 @@ import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
         entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost],
-        synchronize: false, // IMPORTANTE: Desactivado para evitar conflictos con datos existentes
+        synchronize: true, // Crear tablas automáticamente
       }),
       inject: [ConfigService],
     }),

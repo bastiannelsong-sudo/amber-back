@@ -171,14 +171,14 @@ export class NotificationService {
     if (!buyer) {
       buyer = this.userRepository.create({
         id: buyerDetails.id,
-        nickname: buyerDetails.nickname,
-        first_name: buyerDetails.first_name,
-        last_name: buyerDetails.last_name,
+        nickname: buyerDetails.nickname || `buyer_${buyerDetails.id}`,
+        first_name: buyerDetails.first_name || '',
+        last_name: buyerDetails.last_name || '',
       });
     } else {
-      buyer.nickname = buyerDetails.nickname;
-      buyer.first_name = buyerDetails.first_name;
-      buyer.last_name = buyerDetails.last_name;
+      buyer.nickname = buyerDetails.nickname || buyer.nickname;
+      buyer.first_name = buyerDetails.first_name || buyer.first_name;
+      buyer.last_name = buyerDetails.last_name || buyer.last_name;
     }
 
     await this.userRepository.save(buyer);
@@ -189,12 +189,13 @@ export class NotificationService {
 
     if (!seller) {
       seller = this.userRepository.create({
-        id: sellerDetails.id
+        id: sellerDetails.id,
+        nickname: sellerDetails.nickname || `user_${sellerDetails.id}`,
+        first_name: sellerDetails.first_name || '',
+        last_name: sellerDetails.last_name || '',
       });
+      await this.userRepository.save(seller);
     }
-
-
-    await this.userRepository.save(seller);
   }
 
   private async saveOrder(orderDetails: any): Promise<Order> {
@@ -402,9 +403,30 @@ export class NotificationService {
 
 
 
+  /**
+   * Extract IVA from a price that includes IVA (19% in Chile)
+   * Formula: iva = price - (price / 1.19) = price * 19 / 119
+   */
+  private extractIva(priceWithIva: number): number {
+    const IVA_RATE = 19;
+    const IVA_DIVISOR = 100 + IVA_RATE; // 119
+    return Math.round((priceWithIva * IVA_RATE) / IVA_DIVISOR);
+  }
+
   private async savePayments(payments: any[], order: Order): Promise<void> {
+    // Log all payment data to see what ML returns
+    console.log(`[NotificationService] Payments for order ${order.id}:`, JSON.stringify(payments, null, 2));
+
     const paymentPromises = payments.map(async (paymentDetail: any) => {
       let payment = await this.paymentRepository.findOne({ where: { id: paymentDetail.id } });
+
+      // Calculate IVA from transaction amount (19% Chilean tax)
+      const transactionAmount = paymentDetail.transaction_amount || 0;
+      const ivaAmount = this.extractIva(transactionAmount);
+
+      // marketplace_fee comes directly from ML payment data (individual order endpoint)
+      const finalMarketplaceFee = paymentDetail.marketplace_fee || 0;
+      console.log(`[NotificationService] Order ${order.id}: marketplace_fee=${finalMarketplaceFee}, shipping=${paymentDetail.shipping_cost}`);
 
       if (!payment) {
         payment = this.paymentRepository.create({
@@ -413,9 +435,10 @@ export class NotificationService {
           payment_method_id: paymentDetail.payment_method_id,
           payment_type: paymentDetail.payment_type,
           status: paymentDetail.status,
-          transaction_amount: paymentDetail.transaction_amount,
+          transaction_amount: transactionAmount,
           shipping_cost: paymentDetail.shipping_cost,
-          marketplace_fee: paymentDetail.marketplace_fee,
+          marketplace_fee: finalMarketplaceFee,
+          iva_amount: ivaAmount,
           total_paid_amount: paymentDetail.total_paid_amount,
           date_approved: new Date(paymentDetail.date_approved),
           currency_id: paymentDetail.currency_id,
@@ -424,9 +447,10 @@ export class NotificationService {
         payment.payment_method_id = paymentDetail.payment_method_id;
         payment.payment_type = paymentDetail.payment_type;
         payment.status = paymentDetail.status;
-        payment.transaction_amount = paymentDetail.transaction_amount;
+        payment.transaction_amount = transactionAmount;
         payment.shipping_cost = paymentDetail.shipping_cost;
-        payment.marketplace_fee = paymentDetail.marketplace_fee;
+        payment.marketplace_fee = finalMarketplaceFee;
+        payment.iva_amount = ivaAmount;
         payment.total_paid_amount = paymentDetail.total_paid_amount;
         payment.date_approved = new Date(paymentDetail.date_approved);
         payment.currency_id = paymentDetail.currency_id;
@@ -436,6 +460,94 @@ export class NotificationService {
     });
 
     await this.paymentRepository.save(await Promise.all(paymentPromises));
+  }
+
+  /**
+   * Fetch billing info from Mercado Libre API to get marketplace fees
+   */
+  private async getOrderBillingInfo(order: Order): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: order.seller.id },
+      });
+
+      if (!session) {
+        console.log(`[NotificationService] No session found for seller ${order.seller.id}`);
+        return null;
+      }
+
+      const response: AxiosResponse = await firstValueFrom(
+        this.httpService.get(`${this.apiUrl}/orders/${order.id}/billing_info`, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        }),
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(`[NotificationService] Error fetching billing info for order ${order.id}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Extract marketplace fee from billing info response
+   */
+  private extractMarketplaceFee(billingInfo: any): number {
+    // Log full billing info structure for debugging
+    console.log(`[NotificationService] Full billing info:`, JSON.stringify(billingInfo, null, 2));
+
+    if (!billingInfo) {
+      return 0;
+    }
+
+    // Try different possible structures in ML billing info response
+    // Structure 1: billing_info.details array
+    if (billingInfo.billing_info?.details) {
+      const details = billingInfo.billing_info.details;
+      let totalFee = 0;
+
+      for (const detail of details) {
+        // Look for marketplace fee types
+        if (detail.type === 'fee' || detail.type === 'marketplace_fee' ||
+            detail.type === 'ml_fee' || detail.type === 'sale_fee') {
+          totalFee += Math.abs(detail.amount || 0);
+        }
+      }
+
+      if (totalFee > 0) return totalFee;
+    }
+
+    // Structure 2: Direct fees array
+    if (billingInfo.fees) {
+      let totalFee = 0;
+      for (const fee of billingInfo.fees) {
+        totalFee += Math.abs(fee.amount || 0);
+      }
+      if (totalFee > 0) return totalFee;
+    }
+
+    // Structure 3: sale_fee or marketplace_fee direct property
+    if (billingInfo.sale_fee) {
+      return Math.abs(billingInfo.sale_fee);
+    }
+    if (billingInfo.marketplace_fee) {
+      return Math.abs(billingInfo.marketplace_fee);
+    }
+
+    // Structure 4: billing_info with transactions
+    if (billingInfo.billing_info?.transactions) {
+      let totalFee = 0;
+      for (const transaction of billingInfo.billing_info.transactions) {
+        if (transaction.type === 'fee' || transaction.type?.includes('fee')) {
+          totalFee += Math.abs(transaction.amount || 0);
+        }
+      }
+      if (totalFee > 0) return totalFee;
+    }
+
+    return 0;
   }
 
 

@@ -16,6 +16,8 @@ export class Product {
   @Column({ type: 'int' })
   stock: number;
 
+  @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
+  cost: number;
 
   @OneToMany(
     () => SecondarySku,

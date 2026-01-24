@@ -27,6 +27,15 @@ export class Payment {
   @Column('decimal', { precision: 10, scale: 2 })
   marketplace_fee: number;
 
+  @Column('decimal', { precision: 10, scale: 2, nullable: true })
+  iva_amount: number;
+
+  @Column('decimal', { precision: 10, scale: 2, nullable: true, default: 0 })
+  shipping_bonus: number; // Bonificación por envío que ML da al vendedor (para envíos gratis >$20k)
+
+  @Column('decimal', { precision: 10, scale: 2, nullable: true, default: 0 })
+  courier_cost: number; // Costo externo del courier (para envíos gratis >$20k) - NO es el "envío" de ML
+
   @Column('decimal', { precision: 10, scale: 2 })
   total_paid_amount: number;
 

@@ -118,4 +118,224 @@ export class MercadoLibreService {
       throw error;
     }
   }
+
+  /**
+   * Get full order details from ML API (includes complete payment info with fees)
+   */
+  async getOrderDetails(orderId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/orders/${orderId}`;
+      console.log(`[MercadoLibreService] Fetching order details: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Order details payments:`, JSON.stringify(response.data?.payments, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching order details ${orderId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get billing info for an order to retrieve marketplace fees
+   */
+  async getOrderBillingInfo(orderId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/orders/${orderId}/billing_info`;
+      console.log(`[MercadoLibreService] Fetching billing info: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Billing info response:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching billing info for order ${orderId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get shipment info for an order to retrieve logistic_type
+   */
+  async getOrderShipment(orderId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/orders/${orderId}/shipments`;
+      console.log(`[MercadoLibreService] Fetching shipment info: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Shipment logistic_type: ${response.data?.logistic_type}`);
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching shipment for order ${orderId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get shipment costs breakdown - this may contain the actual shipping cost charged to seller
+   */
+  async getShipmentCosts(shipmentId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/shipments/${shipmentId}/costs`;
+      console.log(`[MercadoLibreService] Fetching shipment costs: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Shipment costs response:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching shipment costs ${shipmentId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get full shipment details by shipment ID
+   */
+  async getShipmentById(shipmentId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log(`[MercadoLibreService] No session found for seller ${sellerId}`);
+        return null;
+      }
+
+      const url = `${this.apiUrl}/shipments/${shipmentId}`;
+      console.log(`[MercadoLibreService] Fetching shipment by ID: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[MercadoLibreService] Shipment by ID response:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching shipment ${shipmentId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Extract marketplace fee from billing info response
+   * Handles different structures that ML API might return
+   */
+  extractMarketplaceFee(billingInfo: any): number {
+    if (!billingInfo) {
+      return 0;
+    }
+
+    // Structure 1: billing_info.details array with type=fee
+    if (billingInfo.billing_info?.details) {
+      const details = billingInfo.billing_info.details;
+      let totalFee = 0;
+
+      for (const detail of details) {
+        if (detail.type === 'fee' || detail.type === 'marketplace_fee' ||
+            detail.type === 'ml_fee' || detail.type === 'sale_fee') {
+          totalFee += Math.abs(detail.amount || 0);
+        }
+      }
+
+      if (totalFee > 0) return totalFee;
+    }
+
+    // Structure 2: Direct fees array
+    if (billingInfo.fees) {
+      let totalFee = 0;
+      for (const fee of billingInfo.fees) {
+        totalFee += Math.abs(fee.amount || 0);
+      }
+      if (totalFee > 0) return totalFee;
+    }
+
+    // Structure 3: Direct properties
+    if (billingInfo.sale_fee) {
+      return Math.abs(billingInfo.sale_fee);
+    }
+    if (billingInfo.marketplace_fee) {
+      return Math.abs(billingInfo.marketplace_fee);
+    }
+
+    // Structure 4: billing_info.transactions
+    if (billingInfo.billing_info?.transactions) {
+      let totalFee = 0;
+      for (const transaction of billingInfo.billing_info.transactions) {
+        if (transaction.type === 'fee' || transaction.type?.includes('fee')) {
+          totalFee += Math.abs(transaction.amount || 0);
+        }
+      }
+      if (totalFee > 0) return totalFee;
+    }
+
+    return 0;
+  }
 }

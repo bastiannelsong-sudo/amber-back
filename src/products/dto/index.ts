@@ -13,6 +13,10 @@ export class CreateProductDto {
   stock: number;
 
   @IsNumber()
+  @IsOptional()
+  cost?: number;
+
+  @IsNumber()
   category_id: number;
 
   @IsArray()
@@ -35,3 +39,7 @@ export class SecondarySkuDto {
   @IsNumber()
   platform_id: number;
 }
+
+// Re-export other DTOs
+export { UpdateProductDto } from './update-product.dto';
+export { AdjustStockDto } from './adjust-stock.dto';

@@ -23,5 +23,6 @@ import { AuthModule } from '../auth/auth.module';
     HttpModule, // Importar el módulo de HTTP
   ],
   providers: [MercadoLibreService],
+  exports: [MercadoLibreService], // Exportar para uso en otros módulos
 })
 export class MercadoLibreModule {}

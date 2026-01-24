@@ -13,7 +13,7 @@ export const AppDataSource = new DataSource({
   password: '123456', // Contraseña de PostgreSQL
   database: 'amber', // Nombre de la base de datos
   entities: [User, Order, OrderItem, Payment],
-  synchronize: true,       // Auto genera tablas en la base de datos (usar solo en desarrollo)
+  synchronize: false,       // Auto genera tablas en la base de datos (usar solo en desarrollo)
   logging: true
 });
 

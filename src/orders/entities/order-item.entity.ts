@@ -40,4 +40,6 @@ export class OrderItem {
   @Column({nullable: true})
   seller_sku: string;
 
+  @Column({ nullable: true })
+  thumbnail: string;
 }

@@ -20,6 +20,11 @@ import { SecondarySku } from './products/entities/secondary-sku.entity';
 import { Category } from './products/entities/category.entity';
 import { ProductAudit } from './notification/entities/product-audit.entity';
 import { MercadoLibreModule } from './mercadolibre/mercadolibre.module';
+import { ProductHistory } from './products/entities/product-history.entity';
+import { ProductMapping } from './products/entities/product-mapping.entity';
+import { PendingSale } from './notification/entities/pending-sale.entity';
+import { InventoryModule } from './inventory/inventory.module';
+import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
 
 @Module({
   imports: [
@@ -36,8 +41,8 @@ import { MercadoLibreModule } from './mercadolibre/mercadolibre.module';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session,Product,Platform,SecondarySku,Category,ProductAudit],
-        synchronize: true,
+        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost],
+        synchronize: false, // IMPORTANTE: Desactivado para evitar conflictos con datos existentes
       }),
       inject: [ConfigService],
     }),
@@ -47,7 +52,8 @@ import { MercadoLibreModule } from './mercadolibre/mercadolibre.module';
     NotificationModule,
     HttpModule,
     ProductsModule,
-    MercadoLibreModule
+    MercadoLibreModule,
+    InventoryModule
 
   ],
   controllers: [NotificationController],

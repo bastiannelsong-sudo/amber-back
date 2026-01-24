@@ -35,7 +35,7 @@ import { Category } from './products/entities/category.entity';
                 password: configService.get('DB_PASSWORD'),
                 database: configService.get('DB_DATABASE'),
                 entities: [User, Order, OrderItem, Payment, Notification, Session, AuditLog, Product, Platform, SecondarySku, Category],
-                synchronize: true,
+                synchronize: false,
             }),
             inject: [ConfigService],
         }),

@@ -51,4 +51,4 @@ ENV NODE_ENV=production
 ENV PORT=3000
 
 # Comando de inicio
-CMD ["node", "dist/main.js"]
+CMD ["node", "dist/src/main.js"]

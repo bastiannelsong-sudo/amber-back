@@ -10,14 +10,17 @@ import {
   Query,
   Redirect,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { MercadoLibreAuthService } from './mercado-libre-auth.service';
 import { Session } from './entities/session.entity';
 import { SessionCacheService } from './session-cache.service';
 
 @Controller('auth')
 export class MercadoLibreAuthController {
-  constructor(private readonly authService: MercadoLibreAuthService,
-              private readonly sessionCacheService: SessionCacheService
+  constructor(
+    private readonly authService: MercadoLibreAuthService,
+    private readonly sessionCacheService: SessionCacheService,
+    private readonly configService: ConfigService,
   ) {}
 
   @Get('login')
@@ -38,7 +41,8 @@ export class MercadoLibreAuthController {
 
     const user = await this.authService.getUserInfo(tokenData.user_id);
 
-    const redirectUrl = `http://localhost:5173/callback?message=Successfully%20authenticated&userId=${tokenData.user_id}&nickname=${user.nickname}&email=${user.email}`
+    const frontendUrl = this.configService.get<string>('FRONTEND_URL') || 'http://localhost:5173';
+    const redirectUrl = `${frontendUrl}/callback?message=Successfully%20authenticated&userId=${tokenData.user_id}&nickname=${user.nickname}&email=${user.email}`;
 
     return { url: redirectUrl };
   }

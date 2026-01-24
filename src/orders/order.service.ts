@@ -316,6 +316,10 @@ export class OrderService {
             nickname: order.buyer.nickname || '',
             first_name: order.buyer.first_name || '',
             last_name: order.buyer.last_name || '',
+            // Datos del destinatario del envío (almacenados en la orden)
+            receiver_name: (order as any).receiver_name || undefined,
+            receiver_phone: (order as any).receiver_phone || undefined,
+            receiver_rut: (order as any).receiver_rut || undefined,
           }
         : undefined,
     };
@@ -574,6 +578,10 @@ export class OrderService {
     let flexShippingIncome = 0; // Shipping income for Flex orders (gross_amount = full amount before buyer discounts)
     let shippingBonus = 0; // Bonificación por envío que ML da al vendedor (para envíos gratis >$20k)
     let courierCost = 0; // Costo externo del courier (para envíos gratis >$20k) - separado de shipping_cost
+    // Datos del destinatario (receiver) del envío
+    let receiverName: string | null = null;
+    let receiverPhone: string | null = null;
+    let receiverRut: string | null = null;
     console.log(`[Sync] Order ${mlOrder.id}: initial logistic_type=${logisticType}, shipping_id=${mlOrder.shipping?.id}`);
 
     // Fetch shipment data if we have a shipping_id
@@ -594,6 +602,17 @@ export class OrderService {
       if (shipmentData?.logistic_type) {
         logisticType = shipmentData.logistic_type;
         console.log(`[Sync] Got logistic_type from shipment API: ${logisticType}`);
+      }
+
+      // Extraer datos del destinatario (receiver) del envío
+      if (shipmentData?.receiver_address) {
+        receiverName = shipmentData.receiver_address.receiver_name || null;
+        receiverPhone = shipmentData.receiver_address.receiver_phone || null;
+        // El RUT viene en identification.number
+        if (shipmentData.receiver_address.identification?.number) {
+          receiverRut = shipmentData.receiver_address.identification.number;
+        }
+        console.log(`[Sync] Receiver data: name=${receiverName}, phone=${receiverPhone}, rut=${receiverRut}`);
       }
 
       // Use the correct shipment ID for fetching costs
@@ -675,6 +694,10 @@ export class OrderService {
       shipping_id: mlOrder.shipping?.id?.toString() || null,
       logistic_type: logisticType,
       pack_id: mlOrder.pack_id || null,
+      // Datos del destinatario del envío
+      receiver_name: receiverName,
+      receiver_phone: receiverPhone,
+      receiver_rut: receiverRut,
     };
 
     // Only add buyer if we have a valid buyer id

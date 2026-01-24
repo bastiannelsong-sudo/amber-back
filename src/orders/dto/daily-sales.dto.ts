@@ -85,6 +85,10 @@ export class OrderSummaryDto {
     nickname: string;
     first_name: string;
     last_name: string;
+    // Datos del destinatario del envío
+    receiver_name?: string;
+    receiver_phone?: string;
+    receiver_rut?: string;
   };
 }
 

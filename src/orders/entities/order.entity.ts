@@ -60,4 +60,14 @@ export class Order {
 
   @Column({ type: 'bigint', nullable: true })
   pack_id: number;
+
+  // Datos del destinatario (receiver) del envío
+  @Column({ nullable: true })
+  receiver_name: string;
+
+  @Column({ nullable: true })
+  receiver_phone: string;
+
+  @Column({ nullable: true })
+  receiver_rut: string;
 }

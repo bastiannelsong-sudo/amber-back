@@ -25,6 +25,15 @@ export class MercadoLibreService {
     this.apiUrl = this.configService.get<string>('MERCADO_LIBRE_API_URL');
   }
 
+  /**
+   * Get the previous calendar date string (YYYY-MM-DD) given a date string.
+   */
+  private getPreviousDate(dateStr: string): string {
+    const d = new Date(`${dateStr}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().slice(0, 10);
+  }
+
   async getOrdersByDate(date: string, sellerId: number): Promise<any[]> {
     let session: Session | null = null;
     try {
@@ -41,44 +50,42 @@ export class MercadoLibreService {
       const accessToken = session.access_token;
       console.log('Intentando acceder con el token:', accessToken);
 
-      const fromDate = `${date}T00:00:00.000-04:00`;
+      // ML API internally uses -04:00 for Chile regardless of DST.
+      // During Chilean summer (-03:00), orders between 00:00-00:59 Chilean time
+      // are 23:00-23:59 in ML's -04:00 timezone (previous ML day).
+      // To capture these, extend the sync range 1 hour backward into the previous day.
+      // Duplicates are handled by upsert in the sync process.
+      const prevDate = this.getPreviousDate(date);
+      const fromDate = `${prevDate}T23:00:00.000-04:00`;
       const toDate = `${date}T23:59:59.999-04:00`;
 
-      // Fetch ALL orders using pagination
-      // We need to fetch both paid AND cancelled orders separately
-      // ML API defaults to only returning 'paid' status orders
+      // Fetch ALL orders using pagination (no status filter = all statuses)
       const allOrders: any[] = [];
+      let offset = 0;
+      const limit = 50; // ML API max per page
+      let totalOrders = 0;
 
-      // Fetch orders for each status we care about
-      const statusesToFetch = ['paid', 'cancelled'];
+      do {
+        const url = `${this.BASE_URL}?seller=${sellerId}&order.date_created.from=${fromDate}&order.date_created.to=${toDate}&offset=${offset}&limit=${limit}`;
+        console.log(`[MercadoLibreService] Fetching ALL orders page: offset=${offset}, limit=${limit}`);
 
-      for (const status of statusesToFetch) {
-        let offset = 0;
-        const limit = 50; // ML API max per page
-        let totalOrders = 0;
+        const response = await firstValueFrom(
+          this.httpService.get(url, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          })
+        );
 
-        do {
-          const url = `${this.BASE_URL}?seller=${sellerId}&order.date_created.from=${fromDate}&order.date_created.to=${toDate}&order.status=${status}&offset=${offset}&limit=${limit}`;
-          console.log(`[MercadoLibreService] Fetching ${status} orders page: offset=${offset}, limit=${limit}`);
+        const data = response.data;
+        totalOrders = data.paging?.total || 0;
+        const results = data.results || [];
 
-          const response = await firstValueFrom(
-            this.httpService.get(url, {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-              },
-            })
-          );
+        allOrders.push(...results);
+        console.log(`[MercadoLibreService] Fetched ${results.length} orders (total so far: ${allOrders.length}/${totalOrders})`);
 
-          const data = response.data;
-          totalOrders = data.paging?.total || 0;
-          const results = data.results || [];
-
-          allOrders.push(...results);
-          console.log(`[MercadoLibreService] Fetched ${results.length} ${status} orders (total so far: ${allOrders.length})`);
-
-          offset += limit;
-        } while (offset < totalOrders);
-      }
+        offset += limit;
+      } while (offset < totalOrders);
 
       console.log(`[MercadoLibreService] Total orders fetched for ${date}: ${allOrders.length}`);
 
@@ -95,6 +102,131 @@ export class MercadoLibreService {
         console.error('Error en la solicitud:', error.message);
         throw new Error('No se pudieron obtener las órdenes');
       }
+    }
+  }
+
+  /**
+   * Get orders that were UPDATED (not created) in a date range
+   * This catches status changes like cancellations, returns, etc.
+   * Uses order.date_last_updated instead of order.date_created
+   */
+  async getOrdersUpdatedInRange(fromDate: string, toDate: string, sellerId: number): Promise<any[]> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        console.log('No se encontró sesión activa para el usuario:', sellerId);
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const accessToken = session.access_token;
+
+      // ML API uses -04:00 for Chile internally. Extend range 1 hour backward
+      // to capture orders in Chilean midnight DST gap (same logic as getOrdersByDate).
+      const prevFromDate = this.getPreviousDate(fromDate);
+      const fromDateISO = `${prevFromDate}T23:00:00.000-04:00`;
+      const toDateISO = `${toDate}T23:59:59.999-04:00`;
+
+      const allOrders: any[] = [];
+      let offset = 0;
+      const limit = 50;
+      let totalOrders = 0;
+
+      do {
+        // Use date_last_updated instead of date_created to catch status changes (no status filter = all)
+        const url = `${this.BASE_URL}?seller=${sellerId}&order.date_last_updated.from=${fromDateISO}&order.date_last_updated.to=${toDateISO}&offset=${offset}&limit=${limit}`;
+        console.log(`[MercadoLibreService] Fetching ALL updated orders: offset=${offset}`);
+
+        const response = await firstValueFrom(
+          this.httpService.get(url, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          })
+        );
+
+        const data = response.data;
+        totalOrders = data.paging?.total || 0;
+        const results = data.results || [];
+
+        allOrders.push(...results);
+        console.log(`[MercadoLibreService] Fetched ${results.length} updated orders (total so far: ${allOrders.length}/${totalOrders})`);
+
+        offset += limit;
+      } while (offset < totalOrders);
+
+      console.log(`[MercadoLibreService] Total UPDATED orders fetched: ${allOrders.length}`);
+
+      return {
+        paging: { total: allOrders.length, offset: 0, limit: allOrders.length },
+        results: allOrders,
+      } as any;
+    } catch (error) {
+      console.error('Error fetching updated orders:', error.message);
+      throw new Error('No se pudieron obtener las órdenes actualizadas');
+    }
+  }
+
+  /**
+   * Get recent orders (last N days) that might have status changes
+   * Useful for detecting cancellations, returns, etc.
+   */
+  async getRecentOrders(sellerId: number, daysBack: number = 30): Promise<any[]> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const accessToken = session.access_token;
+
+      // Calculate date range
+      const toDate = new Date();
+      const fromDate = new Date();
+      fromDate.setDate(fromDate.getDate() - daysBack);
+
+      const fromDateISO = fromDate.toISOString();
+      const toDateISO = toDate.toISOString();
+
+      const allOrders: any[] = [];
+      let offset = 0;
+      const limit = 50;
+      let totalOrders = 0;
+
+      // Fetch all recent orders (all statuses)
+      do {
+        const url = `${this.BASE_URL}?seller=${sellerId}&order.date_created.from=${fromDateISO}&order.date_created.to=${toDateISO}&offset=${offset}&limit=${limit}`;
+
+        const response = await firstValueFrom(
+          this.httpService.get(url, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          })
+        );
+
+        const data = response.data;
+        totalOrders = data.paging?.total || 0;
+        const results = data.results || [];
+
+        allOrders.push(...results);
+        offset += limit;
+      } while (offset < totalOrders);
+
+      console.log(`[MercadoLibreService] Fetched ${allOrders.length} recent orders (last ${daysBack} days)`);
+
+      return {
+        paging: { total: allOrders.length, offset: 0, limit: allOrders.length },
+        results: allOrders,
+      } as any;
+    } catch (error) {
+      console.error('Error fetching recent orders:', error.message);
+      throw new Error('No se pudieron obtener las órdenes recientes');
     }
   }
 

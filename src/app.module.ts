@@ -25,6 +25,7 @@ import { ProductMapping } from './products/entities/product-mapping.entity';
 import { PendingSale } from './notification/entities/pending-sale.entity';
 import { InventoryModule } from './inventory/inventory.module';
 import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
+import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
 
 @Module({
   imports: [
@@ -41,7 +42,7 @@ import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost],
+        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost, FaztConfiguration],
         synchronize: false,
       }),
       inject: [ConfigService],

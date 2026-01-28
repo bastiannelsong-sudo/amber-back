@@ -36,6 +36,12 @@ export class Payment {
   @Column('decimal', { precision: 10, scale: 2, nullable: true, default: 0 })
   courier_cost: number; // Costo externo del courier (para envíos gratis >$20k) - NO es el "envío" de ML
 
+  @Column('decimal', { precision: 10, scale: 2, nullable: true, default: 0 })
+  fazt_cost: number; // Costo calculado de Fazt según tarifas configuradas (sin IVA)
+
+  @Column({ nullable: true })
+  fazt_is_special_zone: boolean; // Si el envío es a zona especial (Colina, Padre Hurtado)
+
   @Column('decimal', { precision: 10, scale: 2 })
   total_paid_amount: number;
 

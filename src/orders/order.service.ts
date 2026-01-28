@@ -5,7 +5,7 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between } from 'typeorm';
+import { Repository } from 'typeorm';
 import { Order } from './entities/order.entity';
 import { User } from './entities/user.entity';
 import { OrderItem } from './entities/order-item.entity';
@@ -16,10 +16,15 @@ import {
   LogisticTypeSummaryDto,
   DailySalesSummaryDto,
   SyncOrdersResponseDto,
+  SyncMonthlyOrdersResponseDto,
+  PaginatedDateRangeSalesResponseDto,
+  PaginationMetaDto,
+  PackGroupDto,
 } from './dto/daily-sales.dto';
 import { MercadoLibreService } from '../mercadolibre/mercadolibre.service';
 import { TaxService } from '../products/services/tax.service';
 import { MonthlyFlexCostService } from './monthly-flex-cost.service';
+import { FaztConfigurationService } from './fazt-configuration.service';
 
 /**
  * Order Service
@@ -45,7 +50,86 @@ export class OrderService {
     private readonly mercadoLibreService: MercadoLibreService,
     private readonly taxService: TaxService,
     private readonly monthlyFlexCostService: MonthlyFlexCostService,
+    private readonly faztConfigurationService: FaztConfigurationService,
   ) {}
+
+  /**
+   * Format a Date object as a local time string for PostgreSQL naive timestamp comparison.
+   * The DB stores timestamps without timezone (in server's local time),
+   * so we need local time strings for correct comparisons.
+   */
+  private formatLocalTimestamp(d: Date): string {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const h = String(d.getHours()).padStart(2, '0');
+    const min = String(d.getMinutes()).padStart(2, '0');
+    const s = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${y}-${m}-${day} ${h}:${min}:${s}.${ms}`;
+  }
+
+  /**
+   * Get start and end boundaries for a MercadoLibre/SII date using fixed -04:00 timezone.
+   *
+   * MercadoLibre always uses -04:00 for Chile internally (regardless of DST).
+   * The SII (Chilean tax authority) also uses this same date classification.
+   * During Chilean summer (UTC-3), orders between midnight and 1 AM local time
+   * belong to the PREVIOUS day in ML/SII's -04:00 timezone.
+   *
+   * Returns boundaries as local time strings for PostgreSQL naive timestamp queries.
+   *
+   * Example during summer (server at UTC-3):
+   *   getMLDateBoundaries('2026-01-02') → {
+   *     start: '2026-01-02 01:00:00.000',  // 00:00 -04:00 = 01:00 -03:00
+   *     end:   '2026-01-03 00:59:59.999'   // 23:59 -04:00 = 00:59+1d -03:00
+   *   }
+   *
+   * Example during winter (server at UTC-4):
+   *   getMLDateBoundaries('2026-07-02') → {
+   *     start: '2026-07-02 00:00:00.000',  // 00:00 -04:00 = 00:00 -04:00
+   *     end:   '2026-07-02 23:59:59.999'   // 23:59 -04:00 = 23:59 -04:00
+   *   }
+   */
+  private getMLDateBoundaries(dateStr: string): { start: string; end: string } {
+    const startDate = new Date(`${dateStr}T00:00:00.000-04:00`);
+    const endDate = new Date(`${dateStr}T23:59:59.999-04:00`);
+    return {
+      start: this.formatLocalTimestamp(startDate),
+      end: this.formatLocalTimestamp(endDate),
+    };
+  }
+
+  /**
+   * Get start and end boundaries for a local date (no -04:00 offset).
+   *
+   * Uses the server's local timezone (America/Santiago) directly.
+   * Midnight is midnight — no 1-hour shift during summer.
+   * This is the "Mercado Libre" / "sin cortes" mode.
+   */
+  private getLocalDateBoundaries(dateStr: string): { start: string; end: string } {
+    const [year, month, day] = dateStr.split('-').map(Number);
+    const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
+    const endDate = new Date(year, month - 1, day, 23, 59, 59, 999);
+    return {
+      start: this.formatLocalTimestamp(startDate),
+      end: this.formatLocalTimestamp(endDate),
+    };
+  }
+
+  /**
+   * Get date boundaries based on the selected date mode.
+   * - 'sii': ML/SII -04:00 timezone (default)
+   * - 'mercado_libre': Local timezone, no offset (midnight = midnight)
+   */
+  private getDateBoundaries(
+    dateStr: string,
+    dateMode: 'sii' | 'mercado_libre' = 'sii',
+  ): { start: string; end: string } {
+    return dateMode === 'mercado_libre'
+      ? this.getLocalDateBoundaries(dateStr)
+      : this.getMLDateBoundaries(dateStr);
+  }
 
   /**
    * Get all orders with relations
@@ -59,38 +143,34 @@ export class OrderService {
 
   /**
    * Find orders by date for a specific seller
-   * Optimized query with all needed relations loaded in single query
-   *
-   * IMPORTANT: Uses -04:00 timezone (MercadoLibre's timezone for Chile)
-   * ML reports to SII using this timezone, so we must match it
+   * Uses date boundaries based on the selected date mode:
+   * - 'sii': ML/SII -04:00 timezone (matches MercadoLibre billing and SII)
+   * - 'mercado_libre': Local timezone (midnight = midnight, no offset)
    *
    * @param date - Date in YYYY-MM-DD format
    * @param sellerId - Seller ID from Mercado Libre
+   * @param dateMode - Date classification mode ('sii' or 'mercado_libre')
    */
-  async findByDate(date: string, sellerId: number): Promise<Order[]> {
-    // MercadoLibre uses -04:00 timezone for defining days (not Chile's -03:00)
-    // This affects which orders belong to which day for SII reporting
-    const startDate = new Date(`${date}T00:00:00.000-04:00`);
-    const endDate = new Date(`${date}T23:59:59.999-04:00`);
+  async findByDate(
+    date: string,
+    sellerId: number,
+    dateMode: 'sii' | 'mercado_libre' = 'sii',
+  ): Promise<Order[]> {
+    const { start, end } = this.getDateBoundaries(date, dateMode);
+    this.logger.debug(`Fetching orders for seller ${sellerId} on ${date} [${dateMode}] (boundaries: ${start} → ${end})`);
 
-    this.logger.debug(`Fetching orders for seller ${sellerId} on ${date} (ML timezone -04:00)`);
+    const orders = await this.orderRepository
+      .createQueryBuilder('order')
+      .leftJoinAndSelect('order.buyer', 'buyer')
+      .leftJoinAndSelect('order.items', 'items')
+      .leftJoinAndSelect('order.payments', 'payments')
+      .where('order.sellerId = :sellerId', { sellerId })
+      .andWhere('order.date_approved >= :start', { start })
+      .andWhere('order.date_approved <= :end', { end })
+      .orderBy('order.date_approved', 'DESC')
+      .getMany();
 
-    // Single query with all relations - avoids N+1
-    const orders = await this.orderRepository.find({
-      where: {
-        seller: { id: sellerId },
-        date_approved: Between(startDate, endDate),
-      },
-      relations: ['buyer', 'items', 'payments'],
-      order: { date_approved: 'DESC' },
-    });
-
-    // Debug: Log buyer info for each order
-    orders.forEach((order) => {
-      this.logger.debug(
-        `Order ${order.id} has buyer: ${order.buyer ? `ID=${order.buyer.id}, nickname=${order.buyer.nickname}` : 'NULL'}`,
-      );
-    });
+    this.logger.debug(`Found ${orders.length} orders for ${date}`);
 
     return orders;
   }
@@ -116,6 +196,43 @@ export class OrderService {
   }
 
   /**
+   * Find orders by date range for a specific seller
+   * Aggregates orders from fromDate to toDate (inclusive)
+   * Uses date boundaries based on the selected date mode.
+   *
+   * @param fromDate - Start date in YYYY-MM-DD format
+   * @param toDate - End date in YYYY-MM-DD format
+   * @param sellerId - Seller ID from Mercado Libre
+   * @param dateMode - Date classification mode ('sii' or 'mercado_libre')
+   */
+  async findByDateRange(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+    dateMode: 'sii' | 'mercado_libre' = 'sii',
+  ): Promise<Order[]> {
+    const { start } = this.getDateBoundaries(fromDate, dateMode);
+    const { end } = this.getDateBoundaries(toDate, dateMode);
+    this.logger.debug(
+      `Fetching orders for seller ${sellerId} from ${fromDate} to ${toDate} [${dateMode}] (boundaries: ${start} → ${end})`,
+    );
+
+    const orders = await this.orderRepository
+      .createQueryBuilder('order')
+      .leftJoinAndSelect('order.buyer', 'buyer')
+      .leftJoinAndSelect('order.items', 'items')
+      .leftJoinAndSelect('order.payments', 'payments')
+      .where('order.sellerId = :sellerId', { sellerId })
+      .andWhere('order.date_approved >= :start', { start })
+      .andWhere('order.date_approved <= :end', { end })
+      .orderBy('order.date_approved', 'DESC')
+      .getMany();
+
+    this.logger.debug(`Found ${orders.length} orders in date range`);
+    return orders;
+  }
+
+  /**
    * Get daily sales with complete metrics
    * Groups orders by logistic type and calculates financial metrics
    *
@@ -124,8 +241,9 @@ export class OrderService {
   async getDailySales(
     date: string,
     sellerId: number,
+    dateMode: 'sii' | 'mercado_libre' = 'sii',
   ): Promise<DailySalesResponseDto> {
-    const orders = await this.findByDate(date, sellerId);
+    const orders = await this.findByDate(date, sellerId, dateMode);
 
     this.logger.debug(`Found ${orders.length} orders for ${date}`);
 
@@ -146,12 +264,11 @@ export class OrderService {
 
     // Classify by logistic type
     // - fulfillment: Full (ML warehouse)
-    // - cross_docking, self_service: Flex (seller uses own courier, buyer pays shipping to seller)
-    // - cross_docking_cost, self_service_cost: Flex (free shipping >$20k, seller pays shipping)
-    // - xd_drop_off: Centro de Envío (seller drops at ML point, ML charges for shipping)
+    // - self_service: Flex (seller delivers directly, buyer pays shipping to seller)
+    // - self_service_cost: Flex (free shipping >$20k, seller pays courier)
+    // - cross_docking, xd_drop_off: Centro de Envío (seller drops at ML point, ML charges for shipping)
     const isFlexType = (type: string) =>
-      type === 'cross_docking' || type === 'self_service' ||
-      type === 'cross_docking_cost' || type === 'self_service_cost';
+      type === 'self_service' || type === 'self_service_cost';
 
     // Include ALL orders (including cancelled) in classification
     // Cancelled orders count for SII reporting but are excluded from financial sums
@@ -206,19 +323,258 @@ export class OrderService {
   }
 
   /**
+   * Get sales for a date range with complete metrics
+   * Similar to getDailySales but aggregates multiple days
+   *
+   * @param fromDate - Start date in YYYY-MM-DD format
+   * @param toDate - End date in YYYY-MM-DD format
+   * @param sellerId - Seller ID from Mercado Libre
+   */
+  async getDateRangeSales(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+  ): Promise<{
+    from_date: string;
+    to_date: string;
+    seller_id: number;
+    days_count: number;
+    summary: DailySalesSummaryDto;
+    by_logistic_type: {
+      fulfillment: LogisticTypeSummaryDto;
+      cross_docking: LogisticTypeSummaryDto;
+      other: LogisticTypeSummaryDto;
+    };
+    orders: {
+      fulfillment: OrderSummaryDto[];
+      cross_docking: OrderSummaryDto[];
+      other: OrderSummaryDto[];
+    };
+  }> {
+    const orders = await this.findByDateRange(fromDate, toDate, sellerId);
+
+    // Calculate days count
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    const daysCount =
+      Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+
+    this.logger.debug(
+      `Processing ${orders.length} orders for ${daysCount} days (${fromDate} to ${toDate})`,
+    );
+
+    // Use the year-month of fromDate for flex cost lookup
+    // For multi-month ranges, this is a simplification
+    const yearMonth = fromDate.substring(0, 7);
+    const flexCostPerOrder =
+      await this.monthlyFlexCostService.getCostPerOrder(sellerId, yearMonth);
+
+    // Map orders to DTOs
+    const orderSummaries = orders.map((o) =>
+      this.mapToOrderSummary(o, flexCostPerOrder),
+    );
+
+    // Classify by logistic type (same logic as getDailySales)
+    const isFlexType = (type: string) =>
+      type === 'self_service' || type === 'self_service_cost';
+
+    const classified = {
+      fulfillment: orderSummaries.filter(
+        (o) => o.logistic_type === 'fulfillment',
+      ),
+      cross_docking: orderSummaries.filter((o) => isFlexType(o.logistic_type)),
+      other: orderSummaries.filter(
+        (o) =>
+          o.logistic_type !== 'fulfillment' && !isFlexType(o.logistic_type),
+      ),
+    };
+
+    // Calculate metrics per logistic type
+    const byLogisticType = {
+      fulfillment: this.calculateLogisticTypeSummary(
+        classified.fulfillment,
+        'fulfillment',
+        'Full',
+      ),
+      cross_docking: this.calculateLogisticTypeSummary(
+        classified.cross_docking,
+        'cross_docking',
+        'Flex',
+      ),
+      other: this.calculateLogisticTypeSummary(
+        classified.other,
+        'other',
+        'Centro de Envío',
+      ),
+    };
+
+    // Calculate overall summary
+    const summary = this.calculateTotalSummary([
+      byLogisticType.fulfillment,
+      byLogisticType.cross_docking,
+      byLogisticType.other,
+    ]);
+
+    return {
+      from_date: fromDate,
+      to_date: toDate,
+      seller_id: sellerId,
+      days_count: daysCount,
+      summary,
+      by_logistic_type: byLogisticType,
+      orders: classified,
+    };
+  }
+
+  /**
+   * Get sales for a date range with pagination
+   * Returns a flat list of orders (all types combined) with pagination metadata
+   * Summary and by_logistic_type are calculated from ALL orders (not just current page)
+   *
+   * @param fromDate - Start date in YYYY-MM-DD format
+   * @param toDate - End date in YYYY-MM-DD format
+   * @param sellerId - Seller ID from Mercado Libre
+   * @param page - Page number (1-indexed)
+   * @param limit - Number of orders per page
+   * @param logisticType - Optional filter by logistic type
+   * @param dateMode - Date classification mode ('sii' or 'chile')
+   */
+  async getDateRangeSalesPaginated(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+    page: number = 1,
+    limit: number = 20,
+    logisticType?: string,
+    dateMode: 'sii' | 'mercado_libre' = 'sii',
+  ): Promise<PaginatedDateRangeSalesResponseDto> {
+    const orders = await this.findByDateRange(fromDate, toDate, sellerId, dateMode);
+
+    // Calculate days count
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    const daysCount =
+      Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+
+    this.logger.debug(
+      `Processing ${orders.length} orders for ${daysCount} days (${fromDate} to ${toDate}) - Page ${page}, Limit ${limit}`,
+    );
+
+    // Use the year-month of fromDate for flex cost lookup
+    const yearMonth = fromDate.substring(0, 7);
+    const flexCostPerOrder =
+      await this.monthlyFlexCostService.getCostPerOrder(sellerId, yearMonth);
+
+    // Map ALL orders to DTOs (needed for summary calculation)
+    const allOrderSummaries = orders.map((o) =>
+      this.mapToOrderSummary(o, flexCostPerOrder),
+    );
+
+    // Classify by logistic type for summary calculation
+    const isFlexType = (type: string) =>
+      type === 'self_service' || type === 'self_service_cost';
+
+    const classified = {
+      fulfillment: allOrderSummaries.filter(
+        (o) => o.logistic_type === 'fulfillment',
+      ),
+      cross_docking: allOrderSummaries.filter((o) => isFlexType(o.logistic_type)),
+      other: allOrderSummaries.filter(
+        (o) =>
+          o.logistic_type !== 'fulfillment' && !isFlexType(o.logistic_type),
+      ),
+    };
+
+    // Calculate metrics per logistic type (from ALL orders)
+    const byLogisticType = {
+      fulfillment: this.calculateLogisticTypeSummary(
+        classified.fulfillment,
+        'fulfillment',
+        'Full',
+      ),
+      cross_docking: this.calculateLogisticTypeSummary(
+        classified.cross_docking,
+        'cross_docking',
+        'Flex',
+      ),
+      other: this.calculateLogisticTypeSummary(
+        classified.other,
+        'other',
+        'Centro de Envío',
+      ),
+    };
+
+    // Calculate overall summary (from ALL orders)
+    const summary = this.calculateTotalSummary([
+      byLogisticType.fulfillment,
+      byLogisticType.cross_docking,
+      byLogisticType.other,
+    ]);
+
+    // Filter by logistic type if specified
+    let filteredOrders = allOrderSummaries;
+    if (logisticType) {
+      if (logisticType === 'fulfillment') {
+        filteredOrders = classified.fulfillment;
+      } else if (logisticType === 'cross_docking') {
+        filteredOrders = classified.cross_docking;
+      } else if (logisticType === 'other') {
+        filteredOrders = classified.other;
+      }
+    }
+
+    // Sort by date_approved descending (most recent first)
+    filteredOrders.sort((a, b) =>
+      new Date(b.date_approved).getTime() - new Date(a.date_approved).getTime()
+    );
+
+    // Calculate pagination
+    const total = filteredOrders.length;
+    const totalPages = Math.ceil(total / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+
+    // Get orders for current page
+    const paginatedOrders = filteredOrders.slice(startIndex, endIndex);
+
+    // Group paginated orders by pack_id for proper display
+    // This ensures shipping costs are shown at pack level
+    const packs = this.groupOrdersByPack(paginatedOrders);
+
+    const pagination: PaginationMetaDto = {
+      page,
+      limit,
+      total,
+      total_pages: totalPages,
+      has_next: page < totalPages,
+      has_prev: page > 1,
+    };
+
+    return {
+      from_date: fromDate,
+      to_date: toDate,
+      seller_id: sellerId,
+      days_count: daysCount,
+      summary,
+      by_logistic_type: byLogisticType,
+      orders: paginatedOrders,
+      packs, // Orders grouped by pack_id for correct shipping display
+      pagination,
+    };
+  }
+
+  /**
    * Get human-readable label for logistic type
    * - fulfillment: Full (ML warehouse)
-   * - cross_docking, self_service: Flex (seller uses own courier, buyer pays shipping)
-   * - cross_docking_cost, self_service_cost: Flex (free shipping, seller pays)
-   * - xd_drop_off, others: Centro de Envío (seller drops at ML point, ML charges)
+   * - self_service: Flex (seller delivers directly, buyer pays shipping)
+   * - self_service_cost: Flex (free shipping >$20k, seller pays courier)
+   * - cross_docking, xd_drop_off: Centro de Envío (seller drops at ML point, ML ships)
    */
   private getLogisticTypeLabel(logisticType: string | null): string {
     switch (logisticType) {
       case 'fulfillment':
         return 'Full';
-      case 'cross_docking':
       case 'self_service':
-      case 'cross_docking_cost':
       case 'self_service_cost':
         return 'Flex';
       default:
@@ -242,12 +598,12 @@ export class OrderService {
     );
 
     // Check if this is a Flex order with shipping INCOME (seller receives payment)
-    // cross_docking, self_service = normal Flex where buyer pays shipping to seller
-    const isFlexWithIncome = order.logistic_type === 'cross_docking' || order.logistic_type === 'self_service';
+    // self_service = Flex where buyer pays shipping to seller (seller delivers directly)
+    const isFlexWithIncome = order.logistic_type === 'self_service';
 
     // Check if this is a Flex order with shipping COST (free shipping, seller pays)
     // These are orders >$20k where ML offers free shipping but seller still pays courier
-    const isFlexWithCost = order.logistic_type === 'cross_docking_cost' || order.logistic_type === 'self_service_cost';
+    const isFlexWithCost = order.logistic_type === 'self_service_cost';
 
     // Combined check for all Flex types (for external flex cost application)
     const isAnyFlexOrder = isFlexWithIncome || isFlexWithCost;
@@ -259,25 +615,38 @@ export class OrderService {
     const ivaAmount = payment ? Number(payment.iva_amount) || 0 : 0;
     const shippingBonus = payment ? Number(payment.shipping_bonus) || 0 : 0; // Bonificación de ML
     const courierCost = payment ? Number(payment.courier_cost) || 0 : 0; // Costo externo courier
+    const faztCost = payment ? Number((payment as any).fazt_cost) || 0 : 0; // Costo Fazt calculado
 
-    // Check if order is cancelled OR payment is in mediation (return/dispute in progress)
-    // Both cases mean money is not available and shouldn't count towards profits
-    const isCancelledOrUnavailable =
-      order.status === 'cancelled' || payment?.status === 'in_mediation';
+    // Determine cancellation type: mediación, devolución, or cancelada
+    // Priority: in_mediation > refunded > cancelled (payment status takes precedence)
+    let cancellationType: 'cancelled' | 'in_mediation' | 'refunded' | null = null;
+    if (payment?.status === 'in_mediation') {
+      cancellationType = 'in_mediation';
+    } else if (payment?.status === 'refunded') {
+      cancellationType = 'refunded';
+    } else if (order.status === 'cancelled') {
+      cancellationType = 'cancelled';
+    }
+    const isCancelledOrUnavailable = cancellationType !== null;
 
-    // Add external flex shipping cost to total fees for all Flex orders
-    const externalFlexCost = isAnyFlexOrder ? flexCostPerOrder : 0;
+    // Use Fazt cost from payment if available, otherwise fallback to flexCostPerOrder (MonthlyFlexCost)
+    // This allows both systems to coexist during transition
+    const externalFlexCost = isAnyFlexOrder ? (faztCost > 0 ? faztCost : flexCostPerOrder) : 0;
 
     // For Flex orders with INCOME: shipping_cost is INCOME (buyer pays to seller), NOT a cost
-    // For Flex FREE SHIPPING: shipping_cost = $0, but courier_cost IS a cost
+    // For Flex FREE SHIPPING: shipping_cost = $0, courier handled by Fazt (externalFlexCost)
     // For Full/Other: shipping_cost is a COST (paid to ML for logistics)
     const shippingFee = isFlexWithIncome ? 0 : shippingCost;
-    // courier_cost siempre es un costo (solo existe para envíos gratis)
-    const totalFees = shippingFee + courierCost + marketplaceFee + ivaAmount + externalFlexCost;
+    // courier_cost (senders[0].cost from ML API) is informational only — ML does NOT charge this
+    // for Flex orders since the seller uses their own courier (Fazt). The real cost is externalFlexCost.
+    const totalFees = shippingFee + marketplaceFee + ivaAmount + externalFlexCost;
 
     const grossAmount = Number(order.total_amount) || 0;
-    // Net profit = gross - fees + bonus (bonus is income from ML)
-    const netProfit = grossAmount - totalFees + shippingBonus;
+    // For Flex with income: shipping_cost is INCOME from buyer (they pay shipping to seller)
+    // This income should be added to net profit
+    const shippingIncome = isFlexWithIncome ? shippingCost : 0;
+    // Net profit = gross - fees + bonus + shipping income (for Flex)
+    const netProfit = grossAmount - totalFees + shippingBonus + shippingIncome;
     const profitMargin = grossAmount > 0 ? (netProfit / grossAmount) * 100 : 0;
 
     return {
@@ -285,7 +654,8 @@ export class OrderService {
       date_created: order.date_approved,
       date_approved: order.date_approved,
       status: order.status,
-      is_cancelled: isCancelledOrUnavailable, // Cancelled OR in_mediation (return/dispute) - money not available
+      is_cancelled: isCancelledOrUnavailable, // Cancelled OR in_mediation OR refunded - money not available
+      cancellation_type: cancellationType, // Specific reason: 'cancelled', 'in_mediation', 'refunded', or null
       total_amount: grossAmount,
       paid_amount: Number(order.paid_amount) || 0,
       logistic_type: order.logistic_type || 'other',
@@ -326,6 +696,121 @@ export class OrderService {
   }
 
   /**
+   * Group orders by pack_id
+   * Orders with the same pack_id are grouped together
+   * Orders without pack_id are treated as their own "pack" (single order)
+   *
+   * Shipping costs are calculated at pack level since ML charges shipping per pack, not per order
+   */
+  private groupOrdersByPack(orders: OrderSummaryDto[]): PackGroupDto[] {
+    // Group orders by pack_id (use order id as key for orders without pack)
+    const packMap = new Map<string, OrderSummaryDto[]>();
+
+    for (const order of orders) {
+      // Use pack_id if exists, otherwise use order id prefixed with 'single_'
+      const key = order.pack_id ? `pack_${order.pack_id}` : `single_${order.id}`;
+
+      if (!packMap.has(key)) {
+        packMap.set(key, []);
+      }
+      packMap.get(key)!.push(order);
+    }
+
+    // Convert map to array of PackGroupDto
+    const packs: PackGroupDto[] = [];
+
+    for (const [key, packOrders] of packMap) {
+      const firstOrder = packOrders[0];
+      const packId = key.startsWith('pack_')
+        ? Number(key.replace('pack_', ''))
+        : null;
+      const isMultiOrderPack = packOrders.length > 1 && packId !== null;
+
+      // Aggregate values at pack level
+      // IMPORTANT: Shipping values are PER PACK (ML charges once per shipment)
+      // For multi-order packs: shipping_cost, shipping_bonus, flex_shipping_cost, courier_cost
+      // are the SAME on every order - take from first order only to avoid duplication
+      const packTotalAmount = packOrders.reduce((sum, o) => sum + o.gross_amount, 0);
+      const packMarketplaceFee = packOrders.reduce((sum, o) => sum + o.marketplace_fee, 0);
+      const packIvaAmount = packOrders.reduce((sum, o) => sum + o.iva_amount, 0);
+
+      // Shipping: take ONCE from first order (same value duplicated across all orders in pack)
+      const packShippingCost = isMultiOrderPack
+        ? firstOrder.shipping_cost
+        : packOrders.reduce((sum, o) => sum + o.shipping_cost, 0);
+      const packShippingBonus = isMultiOrderPack
+        ? firstOrder.shipping_bonus
+        : packOrders.reduce((sum, o) => sum + o.shipping_bonus, 0);
+      const packFlexShippingCost = isMultiOrderPack
+        ? (firstOrder.flex_shipping_cost || 0)
+        : packOrders.reduce((sum, o) => sum + (o.flex_shipping_cost || 0), 0);
+      const packCourierCost = isMultiOrderPack
+        ? (firstOrder.courier_cost || 0)
+        : packOrders.reduce((sum, o) => sum + (o.courier_cost || 0), 0);
+
+      // Recalculate net profit at pack level to avoid double-counting shipping
+      // For Flex (self_service): shipping_cost is INCOME (buyer pays, seller receives), not a fee
+      // For Centro de Envío (cross_docking/xd_drop_off): shipping_cost is a COST (ML charges seller)
+      const isFlexWithIncome = firstOrder.logistic_type === 'self_service';
+      const shippingFee = isFlexWithIncome ? 0 : packShippingCost;
+      const shippingIncome = isFlexWithIncome ? packShippingCost : 0;
+      const totalFees = shippingFee + packCourierCost + packMarketplaceFee + packIvaAmount + packFlexShippingCost;
+      const packNetProfit = packTotalAmount - totalFees + packShippingBonus + shippingIncome;
+      const packProfitMargin = packTotalAmount > 0
+        ? (packNetProfit / packTotalAmount) * 100
+        : 0;
+
+      // Flatten all items from all orders in pack
+      const allItems = packOrders.flatMap((o) => o.items);
+
+      // Check if any order in pack is cancelled/mediation/refunded
+      const isCancelled = packOrders.some((o) => o.is_cancelled);
+      // Determine pack cancellation type (priority: in_mediation > refunded > cancelled)
+      let packCancellationType: 'cancelled' | 'in_mediation' | 'refunded' | null = null;
+      if (isCancelled) {
+        if (packOrders.some((o) => o.cancellation_type === 'in_mediation')) {
+          packCancellationType = 'in_mediation';
+        } else if (packOrders.some((o) => o.cancellation_type === 'refunded')) {
+          packCancellationType = 'refunded';
+        } else {
+          packCancellationType = 'cancelled';
+        }
+      }
+      const status = packCancellationType || firstOrder.status;
+
+      packs.push({
+        pack_id: packId,
+        pack_total_amount: packTotalAmount,
+        pack_shipping_cost: packShippingCost,
+        pack_marketplace_fee: packMarketplaceFee,
+        pack_iva_amount: packIvaAmount,
+        pack_shipping_bonus: packShippingBonus,
+        pack_flex_shipping_cost: packFlexShippingCost,
+        pack_courier_cost: packCourierCost,
+        pack_net_profit: packNetProfit,
+        pack_profit_margin: packProfitMargin,
+        logistic_type: firstOrder.logistic_type,
+        logistic_type_label: firstOrder.logistic_type_label,
+        date_approved: firstOrder.date_approved,
+        status,
+        is_cancelled: isCancelled,
+        cancellation_type: packCancellationType,
+        buyer: firstOrder.buyer, // Same buyer for all orders in pack
+        orders: packOrders,
+        all_items: allItems,
+      });
+    }
+
+    // Sort by date_approved descending (most recent first)
+    packs.sort(
+      (a, b) =>
+        new Date(b.date_approved).getTime() - new Date(a.date_approved).getTime(),
+    );
+
+    return packs;
+  }
+
+  /**
    * Calculate summary for a logistic type from pre-mapped DTOs
    * Optimized to work with already-transformed data
    *
@@ -340,10 +825,23 @@ export class OrderService {
     // Count ALL orders (including cancelled) for SII reporting
     const totalOrders = orders.length;
 
-    // Filter out cancelled/in_mediation orders for FINANCIAL calculations only
+    // Filter out cancelled/in_mediation/refunded orders for FINANCIAL calculations only
     // These orders are shown in the list but don't affect sums (money not available)
+    const inactiveOrders = orders.filter((o) => o.is_cancelled);
     const activeOrders = orders.filter((o) => !o.is_cancelled);
     const activeOrderCount = activeOrders.length;
+
+    // Break down by cancellation type
+    const pureCancelled = inactiveOrders.filter((o) => o.cancellation_type === 'cancelled');
+    const mediationOrders = inactiveOrders.filter((o) => o.cancellation_type === 'in_mediation');
+    const refundedOrders = inactiveOrders.filter((o) => o.cancellation_type === 'refunded');
+
+    const cancelledCount = pureCancelled.length;
+    const cancelledAmount = pureCancelled.reduce((sum, o) => sum + o.gross_amount, 0);
+    const mediationCount = mediationOrders.length;
+    const mediationAmount = mediationOrders.reduce((sum, o) => sum + o.gross_amount, 0);
+    const refundedCount = refundedOrders.length;
+    const refundedAmount = refundedOrders.reduce((sum, o) => sum + o.gross_amount, 0);
 
     if (totalOrders === 0) {
       return {
@@ -357,10 +855,17 @@ export class OrderService {
         iva_amount: 0,
         shipping_bonus: 0,
         flex_shipping_cost: 0,
+        courier_cost: 0,
         total_fees: 0,
         net_profit: 0,
         average_order_value: 0,
         average_profit_margin: 0,
+        cancelled_count: 0,
+        cancelled_amount: 0,
+        mediation_count: 0,
+        mediation_amount: 0,
+        refunded_count: 0,
+        refunded_amount: 0,
       };
     }
 
@@ -375,11 +880,12 @@ export class OrderService {
         iva: acc.iva + order.iva_amount,
         bonus: acc.bonus + (order.shipping_bonus || 0),
         flexShipping: acc.flexShipping + (order.flex_shipping_cost || 0),
+        courier: acc.courier + (order.courier_cost || 0),
         totalFees: acc.totalFees + order.total_fees, // Pre-calculated, respects Flex logic
         profit: acc.profit + order.net_profit,
         margin: acc.margin + order.profit_margin,
       }),
-      { items: 0, gross: 0, shipping: 0, fee: 0, iva: 0, bonus: 0, flexShipping: 0, totalFees: 0, profit: 0, margin: 0 },
+      { items: 0, gross: 0, shipping: 0, fee: 0, iva: 0, bonus: 0, flexShipping: 0, courier: 0, totalFees: 0, profit: 0, margin: 0 },
     );
 
     return {
@@ -393,11 +899,18 @@ export class OrderService {
       iva_amount: totals.iva,
       shipping_bonus: totals.bonus,
       flex_shipping_cost: totals.flexShipping,
+      courier_cost: totals.courier,
       total_fees: totals.totalFees, // Use pre-calculated total that respects Flex logic
       net_profit: totals.profit,
       // Use activeOrderCount for averages (exclude cancelled from average calculations)
       average_order_value: activeOrderCount > 0 ? totals.gross / activeOrderCount : 0,
       average_profit_margin: activeOrderCount > 0 ? totals.margin / activeOrderCount : 0,
+      cancelled_count: cancelledCount,
+      cancelled_amount: cancelledAmount,
+      mediation_count: mediationCount,
+      mediation_amount: mediationAmount,
+      refunded_count: refundedCount,
+      refunded_amount: refundedAmount,
     };
   }
 
@@ -418,10 +931,17 @@ export class OrderService {
         iva: acc.iva + s.iva_amount,
         bonus: acc.bonus + (s.shipping_bonus || 0),
         flexShipping: acc.flexShipping + (s.flex_shipping_cost || 0),
+        courier: acc.courier + (s.courier_cost || 0),
         totalFees: acc.totalFees + s.total_fees, // Pre-calculated, respects Flex logic
         profit: acc.profit + s.net_profit,
+        cancelledCount: acc.cancelledCount + (s.cancelled_count || 0),
+        cancelledAmount: acc.cancelledAmount + (s.cancelled_amount || 0),
+        mediationCount: acc.mediationCount + (s.mediation_count || 0),
+        mediationAmount: acc.mediationAmount + (s.mediation_amount || 0),
+        refundedCount: acc.refundedCount + (s.refunded_count || 0),
+        refundedAmount: acc.refundedAmount + (s.refunded_amount || 0),
       }),
-      { orders: 0, items: 0, gross: 0, shipping: 0, fee: 0, iva: 0, bonus: 0, flexShipping: 0, totalFees: 0, profit: 0 },
+      { orders: 0, items: 0, gross: 0, shipping: 0, fee: 0, iva: 0, bonus: 0, flexShipping: 0, courier: 0, totalFees: 0, profit: 0, cancelledCount: 0, cancelledAmount: 0, mediationCount: 0, mediationAmount: 0, refundedCount: 0, refundedAmount: 0 },
     );
 
     return {
@@ -433,12 +953,19 @@ export class OrderService {
       iva_amount: totals.iva,
       shipping_bonus: totals.bonus,
       flex_shipping_cost: totals.flexShipping,
+      courier_cost: totals.courier,
       total_fees: totals.totalFees, // Use pre-calculated total
       net_profit: totals.profit,
       average_order_value:
         totals.orders > 0 ? totals.gross / totals.orders : 0,
       average_profit_margin:
         totals.gross > 0 ? (totals.profit / totals.gross) * 100 : 0,
+      cancelled_count: totals.cancelledCount,
+      cancelled_amount: totals.cancelledAmount,
+      mediation_count: totals.mediationCount,
+      mediation_amount: totals.mediationAmount,
+      refunded_count: totals.refundedCount,
+      refunded_amount: totals.refundedAmount,
     };
   }
 
@@ -454,12 +981,12 @@ export class OrderService {
    * Process orders in parallel batches for faster sync
    * @param orders - Array of orders to process
    * @param sellerId - Seller ID
-   * @param batchSize - Number of orders to process in parallel (default 10)
+   * @param batchSize - Number of orders to process in parallel (default 15 - balanced for ML rate limits)
    */
   private async processOrdersInBatches(
     orders: any[],
     sellerId: number,
-    batchSize = 10,
+    batchSize = 15,
   ): Promise<number> {
     let syncedCount = 0;
 
@@ -502,16 +1029,30 @@ export class OrderService {
       const orders = (mlResponse as any)?.results || mlResponse || [];
       this.logger.log(`Received ${orders.length} orders from Mercado Libre`);
 
-      // Process orders in parallel batches (10 at a time to avoid rate limits)
-      const syncedCount = await this.processOrdersInBatches(orders, sellerId, 10);
+      // Process orders in parallel batches (15 at a time - balanced for ML rate limits)
+      const syncedCount = await this.processOrdersInBatches(orders, sellerId, 15);
 
       this.logger.log(`Successfully synced ${syncedCount} orders`);
+
+      // Recalcular costos Fazt para TODO el mes de la fecha sincronizada
+      const yearMonth = date.substring(0, 7); // "YYYY-MM" de "YYYY-MM-DD"
+      let faztTier = null;
+      try {
+        faztTier = await this.faztConfigurationService.recalculateMonthlyFaztCosts(
+          sellerId,
+          yearMonth,
+        );
+        this.logger.log(`Fazt recálculo: ${faztTier.shipments_count} envíos, ${faztTier.total_updated} pagos actualizados`);
+      } catch (error) {
+        this.logger.warn(`Fazt recálculo falló (no crítico): ${error.message}`);
+      }
 
       return {
         synced: syncedCount,
         message: `Se sincronizaron ${syncedCount} órdenes correctamente`,
         date,
         seller_id: sellerId,
+        fazt_tier: faztTier,
       };
     } catch (error) {
       this.logger.error(`Sync failed: ${error.message}`);
@@ -583,11 +1124,26 @@ export class OrderService {
     let receiverPhone: string | null = null;
     let receiverRut: string | null = null;
     console.log(`[Sync] Order ${mlOrder.id}: initial logistic_type=${logisticType}, shipping_id=${mlOrder.shipping?.id}`);
+    let fullOrderDetails: any = null; // Pre-fetch for payments section
+    let shipmentData: any = null;
+    let shipmentCostsData: any = null;
+    let receiverCost = 0;
+    let senderCost = 0;
 
     // Fetch shipment data if we have a shipping_id
     if (mlOrder.shipping?.id) {
       console.log(`[Sync] Fetching shipment for order ${mlOrder.id}...`);
-      let shipmentData = await this.mercadoLibreService.getOrderShipment(mlOrder.id, sellerId);
+
+      // PARALLEL ROUND 1: Fetch independent data simultaneously (~2.5x faster)
+      const [shipmentResult, billingResult, detailsResult] = await Promise.allSettled([
+        this.mercadoLibreService.getOrderShipment(mlOrder.id, sellerId),
+        this.mercadoLibreService.getOrderBillingInfo(mlOrder.id, sellerId),
+        this.mercadoLibreService.getOrderDetails(mlOrder.id, sellerId),
+      ]);
+
+      shipmentData = shipmentResult.status === 'fulfilled' ? shipmentResult.value : null;
+      const billingInfo = billingResult.status === 'fulfilled' ? billingResult.value : null;
+      fullOrderDetails = detailsResult.status === 'fulfilled' ? detailsResult.value : null;
 
       // FALLBACK: For cancelled orders, getOrderShipment may return null
       // In that case, try getShipmentById directly with the shipping_id
@@ -608,74 +1164,96 @@ export class OrderService {
       if (shipmentData?.receiver_address) {
         receiverName = shipmentData.receiver_address.receiver_name || null;
         receiverPhone = shipmentData.receiver_address.receiver_phone || null;
-        // El RUT viene en identification.number
         if (shipmentData.receiver_address.identification?.number) {
           receiverRut = shipmentData.receiver_address.identification.number;
         }
-        console.log(`[Sync] Receiver data: name=${receiverName}, phone=${receiverPhone}, rut=${receiverRut}`);
       }
 
-      // Use the correct shipment ID for fetching costs
+      // Fallback: use billing info for RUT if shipment didn't have it
+      if (!receiverRut && billingInfo?.billing_info?.doc_type === 'RUT' && billingInfo?.billing_info?.doc_number) {
+        receiverRut = billingInfo.billing_info.doc_number;
+      }
+      console.log(`[Sync] Receiver data: name=${receiverName}, phone=${receiverPhone}, rut=${receiverRut}`);
+
+      // ROUND 2: Fetch shipment costs (depends on shipment ID from round 1)
       const shipmentId = shipmentData?.id || mlOrder.shipping?.id;
-      // Fetch shipment costs for all order types to get accurate seller costs
-      const shipmentCostsData = await this.mercadoLibreService.getShipmentCosts(shipmentId, sellerId);
+      shipmentCostsData = await this.mercadoLibreService.getShipmentCosts(shipmentId, sellerId);
       console.log(`[Sync] Shipment costs response:`, JSON.stringify(shipmentCostsData, null, 2));
 
       // Get receiver (buyer) and sender (seller) costs from shipment_costs API
-      const receiverCost = Number(shipmentCostsData?.receiver?.cost) || 0;
-      const senderCost = Number(shipmentCostsData?.senders?.[0]?.cost) || 0;
+      receiverCost = Number(shipmentCostsData?.receiver?.cost) || 0;
+      senderCost = Number(shipmentCostsData?.senders?.[0]?.cost) || 0;
       console.log(`[Sync] Receiver cost: ${receiverCost}, Sender cost: ${senderCost}`);
 
-      // For Flex orders (self_service, cross_docking): seller receives the FULL shipping amount
-      // EDGE CASE: Orders >$20k with free shipping - buyer pays $0, seller PAYS shipping cost
-      if (logisticType === 'self_service' || logisticType === 'cross_docking') {
+      // For Flex self_service orders: seller delivers directly
+      // EDGE CASE: Orders >$20k with free shipping - buyer pays $0, seller PAYS courier cost
+      if (logisticType === 'self_service') {
         if (receiverCost === 0 && senderCost > 0) {
-          // EDGE CASE: Free shipping for buyer, seller PAYS courier separately
-          // Mark this with a special logistic type so frontend knows
-          logisticType = logisticType + '_cost'; // 'self_service_cost' or 'cross_docking_cost'
-          // shipping_cost = $0 (receiver.cost = 0, ML no cobra envío)
-          // courier_cost = what seller pays to courier (separate from "Envío")
+          // Free shipping for buyer, seller PAYS courier separately
+          logisticType = 'self_service_cost';
           shipmentCost = 0; // Envío de ML es $0
           courierCost = senderCost; // Costo externo del courier
 
           // Extract shipping bonus from sender's discounts (ML gives this to offset part of seller's cost)
-          // senders[0].discounts[].promoted_amount is the bonus ML gives
           const senderDiscounts = shipmentCostsData?.senders?.[0]?.discounts || [];
           for (const discount of senderDiscounts) {
             if (discount.promoted_amount) {
               shippingBonus += Number(discount.promoted_amount) || 0;
             }
           }
-          console.log(`[Sync] FREE SHIPPING: Envío ML=$0, Courier cost=${courierCost}, Bonus=${shippingBonus}, logistic_type=${logisticType}`);
+          console.log(`[Sync] FLEX FREE SHIPPING: Envío ML=$0, Courier cost=${courierCost}, Bonus=${shippingBonus}`);
         } else if (shipmentCostsData?.gross_amount) {
-          // Normal case: gross_amount is the FULL shipping value before any buyer discounts
-          // ML covers the discount, so seller always receives gross_amount
+          // Normal Flex: gross_amount is the FULL shipping value before any buyer discounts
           flexShippingIncome = Number(shipmentCostsData.gross_amount);
-          console.log(`[Sync] Flex order - using shipment_costs.gross_amount: ${flexShippingIncome}`);
+          console.log(`[Sync] Flex self_service - gross_amount: ${flexShippingIncome}`);
+        } else if (receiverCost > 0) {
+          // Fallback: receiver.cost = what the buyer pays for shipping (shipping income for seller)
+          flexShippingIncome = receiverCost;
+          console.log(`[Sync] Flex self_service - fallback receiverCost: ${flexShippingIncome}`);
         } else {
-          // Fallback to base_cost if shipment_costs not available
-          flexShippingIncome = Number(shipmentData?.base_cost) || 0;
-          console.log(`[Sync] Flex order - fallback to base_cost: ${flexShippingIncome}`);
+          // Last resort: try base_cost from shipment data, then cost
+          flexShippingIncome = Number(shipmentData?.base_cost) || Number(shipmentData?.cost) || 0;
+          console.log(`[Sync] Flex self_service - fallback base_cost/cost: ${flexShippingIncome}`);
         }
         console.log(`[Sync] Buyer discount info: receiver.discounts=${JSON.stringify(shipmentCostsData?.receiver?.discounts)}`);
       }
+      // For Centro de Envío (cross_docking, xd_drop_off): ML handles shipping
+      // Seller pays NET = senderCost - ML discounts (shown as "Envíos" in ML billing)
+      // This is NOT "free shipping" even if receiverCost === 0 — ML charges seller through billing
+      else if (logisticType === 'cross_docking' || logisticType === 'xd_drop_off') {
+        const senderDiscounts = shipmentCostsData?.senders?.[0]?.discounts || [];
+        let totalMLDiscount = 0;
+
+        // Calculate ML's discount on sender cost
+        // Use promoted_amount (exact $) OR rate (%), but NOT both (they represent the same discount)
+        for (const discount of senderDiscounts) {
+          if (discount.promoted_amount) {
+            totalMLDiscount += Number(discount.promoted_amount) || 0;
+          } else if (discount.rate && discount.rate > 0) {
+            // Fallback: use rate * cost if no promoted_amount
+            totalMLDiscount += senderCost * Number(discount.rate);
+          }
+        }
+
+        // NET shipping cost = what ML actually charges the seller (matches ML billing "Envíos")
+        const netSellerCost = Math.max(0, senderCost - totalMLDiscount);
+        shipmentCost = netSellerCost;
+        // No bonus/courier for Centro de Envío — just the net cost that matches ML billing
+        shippingBonus = 0;
+        courierCost = 0;
+
+        console.log(`[Sync] Centro de Envío (${logisticType}) - gross=${senderCost}, ML discount=${totalMLDiscount}, NET seller pays=${shipmentCost}`);
+        console.log(`[Sync] Centro de Envío - discounts detail: ${JSON.stringify(senderDiscounts)}`);
+      }
       // For fulfillment orders (Full): seller pays senders[0].cost (usually $0, ML handles it)
       else if (logisticType === 'fulfillment') {
-        // For Full orders, seller pays senders[0].cost, NOT payment.shipping_cost
-        // payment.shipping_cost is what BUYER paid, not what seller pays
         shipmentCost = senderCost; // Usually $0 because ML handles fulfillment
         console.log(`[Sync] Full order - seller pays senders[0].cost: ${shipmentCost} (NOT payment.shipping_cost)`);
-      }
-      // For xd_drop_off orders (Centro de Envío), ML charges seller for shipping
-      else if (logisticType === 'xd_drop_off') {
-        // Use shipping_option.list_cost - this is the cost ML charges the seller
-        shipmentCost = Number(shipmentData?.shipping_option?.list_cost) || 0;
-        console.log(`[Sync] Centro de Envío order - shipping_option.list_cost: ${shipmentCost}`);
       }
     }
     console.log(`[Sync] Final: order=${mlOrder.id}, logistic_type=${logisticType}, shipmentCost=${shipmentCost}, flexShippingIncome=${flexShippingIncome}, courierCost=${courierCost}`);
 
-    // Save order - only include buyer if it exists
+    // Save order - use column names directly for relations (TypeORM upsert doesn't handle relation objects)
     const orderData: any = {
       id: mlOrder.id,
       date_approved: new Date(mlOrder.date_closed || mlOrder.date_created),
@@ -688,7 +1266,7 @@ export class OrderService {
       total_amount: mlOrder.total_amount || 0,
       paid_amount: mlOrder.paid_amount || 0,
       currency_id: mlOrder.currency_id || 'CLP',
-      seller: { id: sellerId },
+      sellerId: sellerId, // Use column name directly for upsert
       fulfilled: mlOrder.fulfilled || false,
       tags: mlOrder.tags || [],
       shipping_id: mlOrder.shipping?.id?.toString() || null,
@@ -700,10 +1278,10 @@ export class OrderService {
       receiver_rut: receiverRut,
     };
 
-    // Only add buyer if we have a valid buyer id
+    // Add buyer using column name directly (TypeORM upsert needs column names, not relation objects)
     if (mlOrder.buyer?.id) {
-      orderData.buyer = { id: mlOrder.buyer.id };
-      this.logger.debug(`[Sync] Setting buyer for order ${mlOrder.id}: ${mlOrder.buyer.id}`);
+      orderData.buyerId = mlOrder.buyer.id; // Use column name directly
+      this.logger.debug(`[Sync] Setting buyerId for order ${mlOrder.id}: ${mlOrder.buyer.id}`);
     }
 
     // Use upsert to handle both insert and update cases
@@ -754,9 +1332,10 @@ export class OrderService {
 
     // Upsert payments: use upsert to insert or update based on payment ID
     if (mlOrder.payments?.length) {
-      // The search endpoint doesn't return complete payment info
-      // Fetch the individual order to get marketplace_fee
-      const fullOrderDetails = await this.mercadoLibreService.getOrderDetails(orderId, sellerId);
+      // Fetch order details if not already fetched during parallel round 1
+      if (!fullOrderDetails) {
+        fullOrderDetails = await this.mercadoLibreService.getOrderDetails(orderId, sellerId);
+      }
 
       // Use payments from full order details if available (includes marketplace_fee)
       const paymentsToUse = fullOrderDetails?.payments || mlOrder.payments;
@@ -775,33 +1354,60 @@ export class OrderService {
         const finalMarketplaceFee = payment.marketplace_fee || 0;
 
         // Determine shipping cost based on logistic type:
-        // - Flex (self_service, cross_docking): use gross_amount = full shipping income before buyer discounts
-        // - Flex FREE SHIPPING (_cost suffix): shipping_cost = $0 (ML no cobra), courier_cost = senders[0].cost
-        // - Centro de Envío (xd_drop_off): use shipping_option.list_cost = what ML charges seller
-        // - Full (fulfillment): use senders[0].cost from shipment_costs (usually $0, ML handles it)
+        // - Flex self_service: use gross_amount = full shipping income before buyer discounts
+        // - Flex FREE SHIPPING (self_service_cost): shipping_cost = $0, courier_cost = senders[0].cost
+        // - Centro de Envío (cross_docking, xd_drop_off): NET seller cost = senderCost - ML discounts
+        // - Full (fulfillment): use senders[0].cost from shipment_costs (usually $0)
         let finalShippingCost = payment.shipping_cost || 0;
-        let finalCourierCost = courierCost; // Costo externo del courier (solo para envíos gratis)
+        let finalCourierCost = courierCost; // Costo externo del courier (solo para Flex envío gratis)
 
         if (courierCost > 0) {
-          // Free shipping: Envío de ML = $0, pero hay costo de courier separado
+          // Flex free shipping: Envío de ML = $0, pero hay costo de courier separado
           finalShippingCost = 0;
-          console.log(`[Sync] ✅ FREE SHIPPING DETECTED: Envío ML=$0, Courier=${courierCost}`);
+          console.log(`[Sync] ✅ FLEX FREE SHIPPING: Envío ML=$0, Courier=${courierCost}`);
         } else if (flexShippingIncome > 0) {
-          // Normal Flex: seller receives gross_amount as shipping income
+          // Normal Flex self_service: seller receives gross_amount as shipping income
           finalShippingCost = flexShippingIncome;
           console.log(`[Sync] Flex income: ${flexShippingIncome}`);
         } else if (logisticType === 'fulfillment') {
-          // Full: seller pays senders[0].cost (usually $0), NOT payment.shipping_cost
-          // payment.shipping_cost is what BUYER paid to ML
-          finalShippingCost = shipmentCost; // shipmentCost was set to senderCost above
-          console.log(`[Sync] Full order - using senderCost: ${finalShippingCost} (ignoring payment.shipping_cost=${payment.shipping_cost})`);
-        } else if (shipmentCost > 0) {
-          // Centro de Envío: seller pays this cost to ML
+          // Full: seller pays senders[0].cost (usually $0)
           finalShippingCost = shipmentCost;
-          console.log(`[Sync] Centro de Envío cost: ${shipmentCost}`);
+          console.log(`[Sync] Full order - senderCost: ${finalShippingCost}`);
+        } else if (logisticType === 'cross_docking' || logisticType === 'xd_drop_off') {
+          // Centro de Envío: NET seller cost (matches ML billing "Envíos")
+          finalShippingCost = shipmentCost;
+          finalCourierCost = 0; // No courier, ML handles it
+          console.log(`[Sync] Centro de Envío - NET seller shipping: ${finalShippingCost} (ML billing amount)`);
+        } else if (shipmentCost > 0) {
+          // Other logistic types
+          finalShippingCost = shipmentCost;
+          console.log(`[Sync] Other logistic type cost: ${shipmentCost}`);
+        }
+        // Warn if Flex self_service has $0 shipping - all sources failed
+        if (logisticType === 'self_service' && finalShippingCost === 0 && finalCourierCost === 0) {
+          console.log(`[Sync] ⚠️ FLEX self_service order ${orderId} has $0 shipping income. Sources: gross_amount=${shipmentCostsData?.gross_amount}, receiverCost=${receiverCost}, base_cost=${shipmentData?.base_cost}, payment.shipping_cost=${payment.shipping_cost}`);
         }
         console.log(`[Sync] 💾 SAVING Payment: shipping_cost=${finalShippingCost}, courier_cost=${finalCourierCost}, shipping_bonus=${shippingBonus}`);
         console.log(`[Sync] Final marketplace_fee for order ${orderId}: ${finalMarketplaceFee}`);
+
+        // Fazt cost se calcula en lote DESPUÉS de guardar todas las órdenes del día
+        // (ver recalculateMonthlyFaztCosts en syncFromMercadoLibre).
+        // Aquí solo detectamos zona especial para el flag por orden.
+        let faztIsSpecialZone = false;
+        const isFlexOrder = logisticType?.includes('self_service');
+
+        if (isFlexOrder && shipmentData?.receiver_address?.city?.id) {
+          try {
+            const faztConfig = await this.faztConfigurationService.getConfiguration(sellerId);
+            if (faztConfig) {
+              faztIsSpecialZone = faztConfig.special_zone_city_ids?.includes(
+                String(shipmentData.receiver_address.city.id),
+              ) || false;
+            }
+          } catch (error) {
+            // No crítico, ignorar
+          }
+        }
 
         await this.paymentRepository.upsert(
           {
@@ -816,6 +1422,10 @@ export class OrderService {
             iva_amount: ivaAmount,
             shipping_bonus: shippingBonus, // Bonificación por envío de ML
             courier_cost: finalCourierCost, // Costo externo del courier (envíos gratis >$20k)
+            // fazt_cost: NOT set here — recalculateMonthlyFaztCosts() handles it post-sync.
+            // Setting fazt_cost=0 here caused a race condition when multiple days sync in parallel:
+            // Day A recalculates → correct costs → Day B's upsert overwrites back to 0.
+            fazt_is_special_zone: faztIsSpecialZone, // Si es zona especial
             total_paid_amount: payment.total_paid_amount || 0,
             date_approved: payment.date_approved
               ? new Date(payment.date_approved)
@@ -826,5 +1436,248 @@ export class OrderService {
         );
       }
     }
+  }
+
+  /**
+   * Sync all orders from a specific month from Mercado Libre
+   * Uses PARALLEL processing for faster sync (5 days at a time)
+   * Also recalculates Fazt costs for all Flex orders
+   *
+   * @param yearMonth - Month in YYYY-MM format
+   * @param sellerId - Seller ID from Mercado Libre
+   */
+  async syncMonthFromMercadoLibre(
+    yearMonth: string,
+    sellerId: number,
+  ): Promise<SyncMonthlyOrdersResponseDto> {
+    this.logger.log(`Starting PARALLEL monthly sync for ${yearMonth}, seller ${sellerId}`);
+
+    const [year, month] = yearMonth.split('-').map(Number);
+
+    // Get the number of days in the month
+    const daysInMonth = new Date(year, month, 0).getDate();
+
+    // Build list of dates to sync (excluding future dates)
+    const currentDate = new Date();
+    const datesToSync: string[] = [];
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const checkDate = new Date(dateStr);
+
+      if (checkDate <= currentDate) {
+        datesToSync.push(dateStr);
+      }
+    }
+
+    this.logger.log(`Will sync ${datesToSync.length} days in parallel batches`);
+
+    const details: { date: string; synced: number }[] = [];
+    let totalSynced = 0;
+
+    // Process days in parallel batches (5 days at a time to avoid rate limits)
+    const PARALLEL_DAYS = 5;
+
+    for (let i = 0; i < datesToSync.length; i += PARALLEL_DAYS) {
+      const batch = datesToSync.slice(i, i + PARALLEL_DAYS);
+      this.logger.log(`Processing batch ${Math.floor(i / PARALLEL_DAYS) + 1}/${Math.ceil(datesToSync.length / PARALLEL_DAYS)}: ${batch.join(', ')}`);
+
+      // Sync all days in batch in parallel
+      const results = await Promise.allSettled(
+        batch.map(async (dateStr) => {
+          try {
+            const result = await this.syncFromMercadoLibre(dateStr, sellerId);
+            return { date: dateStr, synced: result.synced };
+          } catch (error) {
+            this.logger.warn(`Error syncing ${dateStr}: ${error.message}`);
+            return { date: dateStr, synced: 0 };
+          }
+        }),
+      );
+
+      // Collect results
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          details.push(result.value);
+          totalSynced += result.value.synced;
+        } else {
+          this.logger.warn(`Batch item failed: ${result.reason}`);
+        }
+      }
+
+      // Small delay between batches to respect rate limits (200ms)
+      if (i + PARALLEL_DAYS < datesToSync.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    // Sort details by date
+    details.sort((a, b) => a.date.localeCompare(b.date));
+
+    const daysProcessed = details.length;
+    this.logger.log(`PARALLEL monthly sync complete: ${totalSynced} orders from ${daysProcessed} days`);
+
+    return {
+      total_synced: totalSynced,
+      days_processed: daysProcessed,
+      message: `Se sincronizaron ${totalSynced} órdenes de ${daysProcessed} días (sync paralelo)`,
+      year_month: yearMonth,
+      seller_id: sellerId,
+      details,
+    };
+  }
+
+  /**
+   * Sync status changes for orders that were UPDATED in a date range
+   * This catches cancellations, returns, payment changes, etc.
+   * Uses date_last_updated to find orders that changed after creation
+   *
+   * @param fromDate - Start date YYYY-MM-DD (updates from)
+   * @param toDate - End date YYYY-MM-DD (updates to)
+   * @param sellerId - Seller ID
+   */
+  async syncStatusChanges(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+  ): Promise<{ updated: number; changes: { order_id: number; old_status: string; new_status: string }[] }> {
+    this.logger.log(`Syncing status changes from ${fromDate} to ${toDate} for seller ${sellerId}`);
+
+    try {
+      // Get orders that were UPDATED (not created) in the date range
+      const mlResponse = await this.mercadoLibreService.getOrdersUpdatedInRange(fromDate, toDate, sellerId);
+      const orders = (mlResponse as any)?.results || mlResponse || [];
+
+      this.logger.log(`Found ${orders.length} orders updated in date range`);
+
+      const changes: { order_id: number; old_status: string; new_status: string }[] = [];
+      let updatedCount = 0;
+
+      for (const mlOrder of orders) {
+        // Check if we have this order in our database
+        const existingOrder = await this.orderRepository.findOne({
+          where: { id: mlOrder.id },
+        });
+
+        if (existingOrder) {
+          // Check if status changed
+          if (existingOrder.status !== mlOrder.status) {
+            this.logger.log(`Order ${mlOrder.id}: status changed from ${existingOrder.status} to ${mlOrder.status}`);
+            changes.push({
+              order_id: mlOrder.id,
+              old_status: existingOrder.status,
+              new_status: mlOrder.status,
+            });
+          }
+
+          // Update the order with latest data
+          await this.saveOrderFromMercadoLibre(mlOrder, sellerId);
+          updatedCount++;
+        } else {
+          // New order we didn't have - save it
+          await this.saveOrderFromMercadoLibre(mlOrder, sellerId);
+          updatedCount++;
+        }
+      }
+
+      this.logger.log(`Sync status changes complete: ${updatedCount} orders updated, ${changes.length} status changes detected`);
+
+      return {
+        updated: updatedCount,
+        changes,
+      };
+    } catch (error) {
+      this.logger.error(`Error syncing status changes: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Sync orders for a date range in parallel
+   * More efficient than syncing day by day
+   *
+   * @param fromDate - Start date YYYY-MM-DD
+   * @param toDate - End date YYYY-MM-DD
+   * @param sellerId - Seller ID
+   */
+  async syncDateRangeParallel(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+  ): Promise<{
+    total_synced: number;
+    days_processed: number;
+    status_changes: number;
+    details: { date: string; synced: number }[];
+  }> {
+    this.logger.log(`Starting PARALLEL date range sync: ${fromDate} to ${toDate}`);
+
+    // Generate list of dates
+    const dates: string[] = [];
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    const current = new Date(start);
+
+    while (current <= end) {
+      const iso = current.toISOString();
+      dates.push(iso.split('T')[0] as string);
+      current.setDate(current.getDate() + 1);
+    }
+
+    this.logger.log(`Will sync ${dates.length} days in parallel`);
+
+    const details: { date: string; synced: number }[] = [];
+    let totalSynced = 0;
+
+    // Process in parallel batches (5 days at a time)
+    const PARALLEL_DAYS = 5;
+
+    for (let i = 0; i < dates.length; i += PARALLEL_DAYS) {
+      const batch = dates.slice(i, i + PARALLEL_DAYS);
+
+      const results = await Promise.allSettled(
+        batch.map(async (dateStr) => {
+          try {
+            const result = await this.syncFromMercadoLibre(dateStr, sellerId);
+            return { date: dateStr, synced: result.synced };
+          } catch (error) {
+            return { date: dateStr, synced: 0 };
+          }
+        }),
+      );
+
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          details.push(result.value);
+          totalSynced += result.value.synced;
+        }
+      }
+
+      // Small delay between batches
+      if (i + PARALLEL_DAYS < dates.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    // ALSO sync status changes to catch orders that were modified after creation
+    // This catches cancellations, returns, etc.
+    let statusChangesCount = 0;
+    try {
+      this.logger.log(`Also checking for status changes in date range...`);
+      const statusResult = await this.syncStatusChanges(fromDate, toDate, sellerId);
+      statusChangesCount = statusResult.changes.length;
+      this.logger.log(`Found ${statusChangesCount} status changes`);
+    } catch (error) {
+      this.logger.warn(`Could not sync status changes: ${error.message}`);
+    }
+
+    details.sort((a, b) => a.date.localeCompare(b.date));
+
+    return {
+      total_synced: totalSynced,
+      days_processed: details.length,
+      status_changes: statusChangesCount,
+      details,
+    };
   }
 }

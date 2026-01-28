@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, OneToMany, PrimaryColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, OneToMany, PrimaryColumn, JoinColumn } from 'typeorm';
 import { User } from './user.entity';
 import { OrderItem } from './order-item.entity';
 import { Payment } from './payment.entity';
@@ -32,10 +32,18 @@ export class Order {
   @Column()
   currency_id: string;
 
-  @ManyToOne(() => User, (user) => user.id)
-  buyer: User;
+  @Column({ nullable: true })
+  buyerId: number;
 
   @ManyToOne(() => User, (user) => user.id)
+  @JoinColumn({ name: 'buyerId' })
+  buyer: User;
+
+  @Column({ nullable: true })
+  sellerId: number;
+
+  @ManyToOne(() => User, (user) => user.id)
+  @JoinColumn({ name: 'sellerId' })
   seller: User;
 
   @OneToMany(() => OrderItem, (item) => item.order)

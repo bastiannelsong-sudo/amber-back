@@ -71,7 +71,6 @@ export class MercadoLibreAuthService {
     let session:Session = await this.sessionRepository.findOne({ where: { user_id: tokenData.user_id } });
 
     if (session) {
-      console.log(typeof session.user_id);
       // Si la sesión ya existe, actualizar los campos relevantes
       session.access_token = tokenData.access_token;
       session.expires_in = tokenData.expires_in;

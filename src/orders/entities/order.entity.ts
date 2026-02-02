@@ -78,4 +78,8 @@ export class Order {
 
   @Column({ nullable: true })
   receiver_rut: string;
+
+  // Estado del envío (para detectar pérdidas en reembolsos post-entrega)
+  @Column({ nullable: true })
+  shipment_status: string;
 }

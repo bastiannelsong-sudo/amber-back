@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { User } from './orders/entities/user.entity';
 import { Order } from './orders/entities/order.entity';
 import { OrderItem } from './orders/entities/order-item.entity';
@@ -10,8 +11,6 @@ import { AuthModule } from './auth/auth.module';
 import { NotificationModule } from './notification/notification.module';
 import { Notification } from './notification/entities/notification.entity';
 import { Session } from './auth/entities/session.entity';
-import { NotificationController } from './notification/notification.controller';
-import { NotificationService } from './notification/notification.service';
 import { HttpModule } from '@nestjs/axios';
 import { ProductsModule } from './products/products.module';
 import { Product } from './products/entities/product.entity';
@@ -26,6 +25,7 @@ import { PendingSale } from './notification/entities/pending-sale.entity';
 import { InventoryModule } from './inventory/inventory.module';
 import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
 import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
+import { MonthlyConfiguration } from './orders/entities/monthly-configuration.entity';
 
 @Module({
   imports: [
@@ -33,6 +33,7 @@ import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
       isGlobal: true,
       envFilePath: '.env',
     }),
+    EventEmitterModule.forRoot(),
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       useFactory: (configService: ConfigService) => ({
@@ -42,7 +43,7 @@ import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost, FaztConfiguration],
+        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost, FaztConfiguration, MonthlyConfiguration],
         synchronize: false,
       }),
       inject: [ConfigService],
@@ -57,7 +58,7 @@ import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
     InventoryModule
 
   ],
-  controllers: [NotificationController],
-  providers: [NotificationService],
+  controllers: [],
+  providers: [],
 })
 export class AppModule {}

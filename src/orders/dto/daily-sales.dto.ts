@@ -31,6 +31,24 @@ export enum DateModeEnum {
 }
 
 /**
+ * Enum for status filter
+ * - all: Show all orders (default)
+ * - active: Only active orders (not cancelled/mediation/refunded)
+ * - cancelled: Only cancelled orders
+ * - in_mediation: Only orders in mediation
+ * - refunded: Only refunded/returned orders
+ * - inactive: All inactive orders (cancelled + mediation + refunded)
+ */
+export enum StatusFilterEnum {
+  ALL = 'all',
+  ACTIVE = 'active',
+  CANCELLED = 'cancelled',
+  IN_MEDIATION = 'in_mediation',
+  REFUNDED = 'refunded',
+  INACTIVE = 'inactive',
+}
+
+/**
  * Query DTO for daily sales endpoint
  * Applies: security-validate-all-input
  */
@@ -81,6 +99,7 @@ export class OrderSummaryDto {
   status: string;
   is_cancelled: boolean; // True if order was cancelled/refunded/in_mediation (shown in list but not counted in sums)
   cancellation_type: 'cancelled' | 'in_mediation' | 'refunded' | null; // Specific reason: cancelada, mediación, devolución
+  shipment_status: string | null; // Estado del envío (delivered, shipped, etc.) - para detectar pérdidas en reembolsos post-entrega
   total_amount: number;
   paid_amount: number;
   logistic_type: string;
@@ -324,6 +343,12 @@ export class GetDateRangeSalesQueryDto {
     message: 'date_mode debe ser: sii o mercado_libre',
   })
   date_mode?: DateModeEnum = DateModeEnum.SII;
+
+  @IsOptional()
+  @IsEnum(StatusFilterEnum, {
+    message: 'status_filter debe ser: all, active, cancelled, in_mediation, refunded, o inactive',
+  })
+  status_filter?: StatusFilterEnum = StatusFilterEnum.ALL;
 }
 
 /**
@@ -389,6 +414,7 @@ export class PackGroupDto {
   status: string;
   is_cancelled: boolean;
   cancellation_type: 'cancelled' | 'in_mediation' | 'refunded' | null;
+  shipment_status: string | null; // Estado del envío (delivered, shipped, etc.) - para detectar pérdidas
 
   // Buyer info (same for all orders in pack)
   buyer?: {
@@ -408,6 +434,69 @@ export class PackGroupDto {
   // All items across all orders in pack (flattened for easy display)
   @Type(() => OrderItemSummaryDto)
   all_items: OrderItemSummaryDto[];
+}
+
+/**
+ * Response DTO for audit summary (reconciliation report).
+ *
+ * Cruza las órdenes de un día con los registros de auditoría de inventario
+ * para detectar órdenes que nunca fueron procesadas (sin descuento).
+ */
+export class AuditSummaryResponseDto {
+  date: string;
+  seller_id: number;
+  total_orders: number; // Total órdenes de ML para ese día
+  inventory_deducted: number; // OK_INTERNO - stock descontado del inventario
+  fulfillment: number; // Logistic type fulfillment — ML maneja stock, no requiere descuento local
+  not_found: number; // NOT_FOUND - webhook procesó pero SKU no mapeado
+  without_audit: number; // Sin auditoría (excluye full/canceladas) = orden nunca procesada
+  pending_mapping: number; // Ventas pendientes de resolución manual
+  cancelled: number; // CANCELLED - órdenes canceladas (stock restaurado)
+  tracking_active: boolean; // true si la fecha está dentro del período de seguimiento (>= MIN_APPROVED_DATE)
+}
+
+/**
+ * DTO for an unprocessed order (sin auditoría).
+ * Incluye items para que el usuario pueda ver qué SKUs faltan.
+ */
+export class UnprocessedOrderItemDto {
+  title: string;
+  seller_sku: string;
+  quantity: number;
+  unit_price: number;
+  thumbnail: string | null;
+}
+
+export class UnprocessedOrderDto {
+  order_id: number;
+  date_approved: Date;
+  status: string;
+  total_amount: number;
+  logistic_type: string;
+  items: UnprocessedOrderItemDto[];
+}
+
+/**
+ * DTO for reprocess result (per order).
+ */
+export class ReprocessItemResultDto {
+  sku: string;
+  status: string;
+  message: string;
+}
+
+export class ReprocessResultDto {
+  order_id: number;
+  status: 'processed' | 'partial' | 'already_processed';
+  message: string;
+  items?: ReprocessItemResultDto[];
+}
+
+export class ReprocessAllResultDto {
+  total: number;
+  processed: number;
+  failed: number;
+  details: ReprocessResultDto[];
 }
 
 /**
@@ -434,4 +523,73 @@ export class PaginatedDateRangeSalesResponseDto {
 
   @Type(() => PaginationMetaDto)
   pagination: PaginationMetaDto;
+}
+
+// ─── Discount History DTOs ──────────────────────────────────
+
+export type DiscountStatus = 'discounted' | 'pending' | 'resolved' | 'ignored' | 'cancelled';
+export type LogisticGroup = 'flex' | 'centro_envio';
+
+export class GetDiscountHistoryQueryDto {
+  @IsString()
+  @IsNotEmpty({ message: 'La fecha inicial es obligatoria' })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, {
+    message: 'Formato de fecha inicial inválido. Use YYYY-MM-DD',
+  })
+  from_date: string;
+
+  @IsString()
+  @IsNotEmpty({ message: 'La fecha final es obligatoria' })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, {
+    message: 'Formato de fecha final inválido. Use YYYY-MM-DD',
+  })
+  to_date: string;
+
+  @IsNumberString({}, { message: 'seller_id debe ser un número válido' })
+  @IsNotEmpty({ message: 'El seller_id es obligatorio' })
+  seller_id: string;
+}
+
+export class DiscountHistoryItemDto {
+  order_id: number;
+  internal_sku: string | null;
+  platform_sku: string | null;
+  quantity: number;
+  status: DiscountStatus;
+  logistic_group: LogisticGroup;
+  error_message: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  created_at: string;
+}
+
+export class DiscountHistoryDaySummaryDto {
+  total_items: number;
+  discounted_count: number;
+  pending_count: number;
+  resolved_count: number;
+  ignored_count: number;
+  cancelled_count: number;
+}
+
+export class DiscountHistoryLogisticDataDto {
+  summary: DiscountHistoryDaySummaryDto;
+  items: DiscountHistoryItemDto[];
+}
+
+export class DiscountHistoryDayDto {
+  date: string;
+  summary: DiscountHistoryDaySummaryDto;
+  by_logistic_group: {
+    flex: DiscountHistoryLogisticDataDto;
+    centro_envio: DiscountHistoryLogisticDataDto;
+  };
+}
+
+export class DiscountHistoryResponseDto {
+  from_date: string;
+  to_date: string;
+  seller_id: number;
+  days: DiscountHistoryDayDto[];
+  totals: DiscountHistoryDaySummaryDto;
 }

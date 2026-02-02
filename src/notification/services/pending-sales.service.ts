@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PendingSale, PendingSaleStatus } from '../entities/pending-sale.entity';
@@ -8,6 +8,8 @@ import { ProductMappingService } from '../../products/services/product-mapping.s
 
 @Injectable()
 export class PendingSalesService {
+  private readonly logger = new Logger(PendingSalesService.name);
+
   constructor(
     @InjectRepository(PendingSale)
     private pendingSaleRepository: Repository<PendingSale>,
@@ -21,27 +23,26 @@ export class PendingSalesService {
   }
 
   async findAll(status?: PendingSaleStatus, platformId?: number): Promise<PendingSale[]> {
-    // Debug log
-    console.log('findAll called with:', { status, platformId, statusType: typeof status });
-
     const queryBuilder = this.pendingSaleRepository
       .createQueryBuilder('pending_sale')
       .leftJoinAndSelect('pending_sale.platform', 'platform')
       .leftJoinAndSelect('pending_sale.product', 'product')
       .orderBy('pending_sale.sale_date', 'DESC');
 
+    // Solo mostrar ventas pendientes desde MIN_APPROVED_DATE
+    const minDateStr = process.env.MIN_APPROVED_DATE || '';
+    const minDate = new Date(minDateStr);
+    if (!isNaN(minDate.getTime())) {
+      queryBuilder.andWhere('pending_sale.sale_date >= :minDate', { minDate });
+    }
+
     if (status) {
-      console.log('Adding status filter:', status);
       queryBuilder.andWhere('pending_sale.status = :status', { status });
     }
 
     if (platformId) {
-      console.log('Adding platformId filter:', platformId);
       queryBuilder.andWhere('pending_sale.platform_id = :platformId', { platformId });
     }
-
-    const query = queryBuilder.getSql();
-    console.log('Generated SQL:', query);
 
     return await queryBuilder.getMany();
   }
@@ -90,7 +91,7 @@ export class PendingSalesService {
         });
       } catch (error) {
         // Si ya existe el mapeo, no es un error crítico
-        console.log('Mapeo ya existe o no se pudo crear:', error.message);
+        this.logger.warn(`Mapeo ya existe o no se pudo crear: ${error.message}`);
       }
     }
 

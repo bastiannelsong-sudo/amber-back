@@ -18,6 +18,12 @@ import {
   SyncMonthlyOrdersResponseDto,
   GetDateRangeSalesQueryDto,
   PaginatedDateRangeSalesResponseDto,
+  AuditSummaryResponseDto,
+  UnprocessedOrderDto,
+  ReprocessResultDto,
+  ReprocessAllResultDto,
+  GetDiscountHistoryQueryDto,
+  DiscountHistoryResponseDto,
 } from './dto/daily-sales.dto';
 
 /**
@@ -105,6 +111,51 @@ export class OrderController {
       query.limit || 20,
       query.logistic_type,
       query.date_mode || 'sii',
+      query.status_filter || 'all',
+    );
+  }
+
+  /**
+   * Get discount history for a date range
+   * GET /orders/discount-history?from_date=YYYY-MM-DD&to_date=YYYY-MM-DD&seller_id=123
+   *
+   * Shows which products were discounted from inventory per day,
+   * grouped by logistic type (Flex vs Centro de Envío).
+   * Excludes fulfillment orders.
+   */
+  @Get('discount-history')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async getDiscountHistory(
+    @Query() query: GetDiscountHistoryQueryDto,
+  ): Promise<DiscountHistoryResponseDto> {
+    const sellerId = parseInt(query.seller_id, 10);
+
+    if (!sellerId || sellerId <= 0) {
+      throw new BadRequestException(
+        'Se requiere un seller_id válido. Por favor inicia sesión.',
+      );
+    }
+
+    const fromDate = new Date(query.from_date);
+    const toDate = new Date(query.to_date);
+    const daysDiff = Math.ceil(
+      (toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
+    if (daysDiff < 0) {
+      throw new BadRequestException(
+        'La fecha inicial debe ser anterior o igual a la fecha final',
+      );
+    }
+
+    if (daysDiff > 31) {
+      throw new BadRequestException('El rango máximo es de 31 días');
+    }
+
+    return this.orderService.getDiscountHistory(
+      query.from_date,
+      query.to_date,
+      sellerId,
     );
   }
 
@@ -129,6 +180,95 @@ export class OrderController {
     }
 
     return this.orderService.syncFromMercadoLibre(query.date, sellerId);
+  }
+
+  /**
+   * Get audit summary for a specific date
+   * GET /orders/audit-summary?date=YYYY-MM-DD&seller_id=123
+   *
+   * Returns how many orders had stock deducted, are fulfillment, pending mapping, etc.
+   * Useful after sync to see the inventory impact of a day's orders.
+   */
+  @Get('audit-summary')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async getAuditSummary(
+    @Query() query: SyncOrdersQueryDto,
+  ): Promise<AuditSummaryResponseDto> {
+    const sellerId = parseInt(query.seller_id, 10);
+
+    if (!sellerId || sellerId <= 0) {
+      throw new BadRequestException(
+        'Se requiere un seller_id válido. Por favor inicia sesión.',
+      );
+    }
+
+    return this.orderService.getAuditSummary(query.date, sellerId);
+  }
+
+  /**
+   * Get unprocessed orders (sin auditoría) for a date
+   * GET /orders/unprocessed?date=YYYY-MM-DD&seller_id=123
+   *
+   * Returns orders that have NO audit record (webhook never processed them).
+   * Excludes fulfillment and cancelled orders.
+   */
+  @Get('unprocessed')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async getUnprocessedOrders(
+    @Query() query: SyncOrdersQueryDto,
+  ): Promise<UnprocessedOrderDto[]> {
+    const sellerId = parseInt(query.seller_id, 10);
+
+    if (!sellerId || sellerId <= 0) {
+      throw new BadRequestException(
+        'Se requiere un seller_id válido. Por favor inicia sesión.',
+      );
+    }
+
+    return this.orderService.getUnprocessedOrders(query.date, sellerId);
+  }
+
+  /**
+   * Reprocess a single missed order (deduct stock + create audit)
+   * GET /orders/reprocess-order?order_id=123&seller_id=456
+   *
+   * Only works if the order has NO existing audits (prevents double-deduction).
+   */
+  @Get('reprocess-order')
+  async reprocessOrder(
+    @Query('order_id') orderIdStr: string,
+    @Query('seller_id') sellerIdStr: string,
+  ): Promise<ReprocessResultDto> {
+    const orderId = parseInt(orderIdStr, 10);
+    const sellerId = parseInt(sellerIdStr, 10);
+
+    if (!orderId || !sellerId) {
+      throw new BadRequestException('Se requiere order_id y seller_id');
+    }
+
+    return this.orderService.reprocessOrder(orderId, sellerId);
+  }
+
+  /**
+   * Reprocess ALL unprocessed orders for a date
+   * GET /orders/reprocess-all?date=YYYY-MM-DD&seller_id=123
+   *
+   * Processes all orders without audits (excluding fulfillment/cancelled).
+   */
+  @Get('reprocess-all')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async reprocessAllOrders(
+    @Query() query: SyncOrdersQueryDto,
+  ): Promise<ReprocessAllResultDto> {
+    const sellerId = parseInt(query.seller_id, 10);
+
+    if (!sellerId || sellerId <= 0) {
+      throw new BadRequestException(
+        'Se requiere un seller_id válido. Por favor inicia sesión.',
+      );
+    }
+
+    return this.orderService.reprocessAllUnprocessed(query.date, sellerId);
   }
 
   /**

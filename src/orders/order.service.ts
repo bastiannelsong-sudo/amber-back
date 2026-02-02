@@ -5,11 +5,13 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { Order } from './entities/order.entity';
 import { User } from './entities/user.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { Payment } from './entities/payment.entity';
+import { ProductAudit } from '../notification/entities/product-audit.entity';
+import { PendingSale } from '../notification/entities/pending-sale.entity';
 import {
   DailySalesResponseDto,
   OrderSummaryDto,
@@ -20,11 +22,26 @@ import {
   PaginatedDateRangeSalesResponseDto,
   PaginationMetaDto,
   PackGroupDto,
+  AuditSummaryResponseDto,
+  UnprocessedOrderDto,
+  ReprocessResultDto,
+  ReprocessAllResultDto,
+  DiscountHistoryResponseDto,
+  DiscountHistoryDayDto,
+  DiscountHistoryDaySummaryDto,
+  DiscountHistoryItemDto,
+  DiscountHistoryLogisticDataDto,
+  DiscountStatus,
+  LogisticGroup,
 } from './dto/daily-sales.dto';
 import { MercadoLibreService } from '../mercadolibre/mercadolibre.service';
 import { TaxService } from '../products/services/tax.service';
 import { MonthlyFlexCostService } from './monthly-flex-cost.service';
 import { FaztConfigurationService } from './fazt-configuration.service';
+import { InventoryService } from '../products/services/inventory.service';
+import { PendingSalesService } from '../notification/services/pending-sales.service';
+import { Product } from '../products/entities/product.entity';
+import { Platform } from '../products/entities/platform.entity';
 
 /**
  * Order Service
@@ -37,6 +54,7 @@ import { FaztConfigurationService } from './fazt-configuration.service';
 @Injectable()
 export class OrderService {
   private readonly logger = new Logger(OrderService.name);
+  private mlPlatformId: number | null = null;
 
   constructor(
     @InjectRepository(Order)
@@ -47,10 +65,17 @@ export class OrderService {
     private readonly orderItemRepository: Repository<OrderItem>,
     @InjectRepository(Payment)
     private readonly paymentRepository: Repository<Payment>,
+    @InjectRepository(ProductAudit)
+    private readonly productAuditRepository: Repository<ProductAudit>,
+    @InjectRepository(PendingSale)
+    private readonly pendingSaleRepository: Repository<PendingSale>,
     private readonly mercadoLibreService: MercadoLibreService,
     private readonly taxService: TaxService,
     private readonly monthlyFlexCostService: MonthlyFlexCostService,
     private readonly faztConfigurationService: FaztConfigurationService,
+    private readonly inventoryService: InventoryService,
+    private readonly pendingSalesService: PendingSalesService,
+    private readonly dataSource: DataSource,
   ) {}
 
   /**
@@ -437,7 +462,8 @@ export class OrderService {
    * @param page - Page number (1-indexed)
    * @param limit - Number of orders per page
    * @param logisticType - Optional filter by logistic type
-   * @param dateMode - Date classification mode ('sii' or 'chile')
+   * @param dateMode - Date classification mode ('sii' or 'mercado_libre')
+   * @param statusFilter - Optional filter by order status (all, active, cancelled, in_mediation, refunded, inactive)
    */
   async getDateRangeSalesPaginated(
     fromDate: string,
@@ -447,6 +473,7 @@ export class OrderService {
     limit: number = 20,
     logisticType?: string,
     dateMode: 'sii' | 'mercado_libre' = 'sii',
+    statusFilter: 'all' | 'active' | 'cancelled' | 'in_mediation' | 'refunded' | 'inactive' = 'all',
   ): Promise<PaginatedDateRangeSalesResponseDto> {
     const orders = await this.findByDateRange(fromDate, toDate, sellerId, dateMode);
 
@@ -470,22 +497,45 @@ export class OrderService {
       this.mapToOrderSummary(o, flexCostPerOrder),
     );
 
-    // Classify by logistic type for summary calculation
+    // Helper to check if logistic type is Flex
     const isFlexType = (type: string) =>
       type === 'self_service' || type === 'self_service_cost';
 
+    // First apply status filter (affects both summary and table)
+    let filteredOrders = allOrderSummaries;
+    if (statusFilter && statusFilter !== 'all') {
+      switch (statusFilter) {
+        case 'active':
+          filteredOrders = filteredOrders.filter((o) => !o.is_cancelled);
+          break;
+        case 'cancelled':
+          filteredOrders = filteredOrders.filter((o) => o.cancellation_type === 'cancelled');
+          break;
+        case 'in_mediation':
+          filteredOrders = filteredOrders.filter((o) => o.cancellation_type === 'in_mediation');
+          break;
+        case 'refunded':
+          filteredOrders = filteredOrders.filter((o) => o.cancellation_type === 'refunded');
+          break;
+        case 'inactive':
+          filteredOrders = filteredOrders.filter((o) => o.is_cancelled);
+          break;
+      }
+    }
+
+    // Classify by logistic type (from status-filtered orders)
     const classified = {
-      fulfillment: allOrderSummaries.filter(
+      fulfillment: filteredOrders.filter(
         (o) => o.logistic_type === 'fulfillment',
       ),
-      cross_docking: allOrderSummaries.filter((o) => isFlexType(o.logistic_type)),
-      other: allOrderSummaries.filter(
+      cross_docking: filteredOrders.filter((o) => isFlexType(o.logistic_type)),
+      other: filteredOrders.filter(
         (o) =>
           o.logistic_type !== 'fulfillment' && !isFlexType(o.logistic_type),
       ),
     };
 
-    // Calculate metrics per logistic type (from ALL orders)
+    // Calculate metrics per logistic type (from status-filtered orders)
     const byLogisticType = {
       fulfillment: this.calculateLogisticTypeSummary(
         classified.fulfillment,
@@ -504,15 +554,14 @@ export class OrderService {
       ),
     };
 
-    // Calculate overall summary (from ALL orders)
+    // Calculate overall summary (from status-filtered orders)
     const summary = this.calculateTotalSummary([
       byLogisticType.fulfillment,
       byLogisticType.cross_docking,
       byLogisticType.other,
     ]);
 
-    // Filter by logistic type if specified
-    let filteredOrders = allOrderSummaries;
+    // Then apply logistic type filter for table display
     if (logisticType) {
       if (logisticType === 'fulfillment') {
         filteredOrders = classified.fulfillment;
@@ -615,7 +664,12 @@ export class OrderService {
     const ivaAmount = payment ? Number(payment.iva_amount) || 0 : 0;
     const shippingBonus = payment ? Number(payment.shipping_bonus) || 0 : 0; // Bonificación de ML
     const courierCost = payment ? Number(payment.courier_cost) || 0 : 0; // Costo externo courier
-    const faztCost = payment ? Number((payment as any).fazt_cost) || 0 : 0; // Costo Fazt calculado
+    const faztCost = payment ? Number(payment.fazt_cost) || 0 : 0; // Costo Fazt calculado
+
+    // Debug log for refunded Flex orders
+    if (isAnyFlexOrder && (payment?.status === 'refunded' || order.status === 'cancelled')) {
+      this.logger.debug(`Order ${order.id} - Flex refunded/cancelled: payment.fazt_cost=${payment?.fazt_cost}, faztCost=${faztCost}, payment exists=${!!payment}`);
+    }
 
     // Determine cancellation type: mediación, devolución, or cancelada
     // Priority: in_mediation > refunded > cancelled (payment status takes precedence)
@@ -656,6 +710,7 @@ export class OrderService {
       status: order.status,
       is_cancelled: isCancelledOrUnavailable, // Cancelled OR in_mediation OR refunded - money not available
       cancellation_type: cancellationType, // Specific reason: 'cancelled', 'in_mediation', 'refunded', or null
+      shipment_status: order.shipment_status || null, // Estado del envío para detectar pérdidas en reembolsos post-entrega
       total_amount: grossAmount,
       paid_amount: Number(order.paid_amount) || 0,
       logistic_type: order.logistic_type || 'other',
@@ -795,6 +850,7 @@ export class OrderService {
         status,
         is_cancelled: isCancelled,
         cancellation_type: packCancellationType,
+        shipment_status: firstOrder.shipment_status, // Estado del envío (todos en el pack comparten el mismo envío)
         buyer: firstOrder.buyer, // Same buyer for all orders in pack
         orders: packOrders,
         all_items: allItems,
@@ -970,13 +1026,413 @@ export class OrderService {
   }
 
   /**
-   * Sync orders from Mercado Libre API
-   * Fetches orders from ML and saves/updates them in the database
+   * Get audit summary for a specific date — reconciliation report.
    *
-   * Applies:
-   * - db-use-transactions: Uses transaction for batch inserts
-   * - error-handle-async-errors: Proper error handling
+   * For each order on this date, checks whether a corresponding stock
+   * deduction (product_audit) exists. Orders WITHOUT any audit record
+   * were never processed = the deduction was missed.
+   *
+   * @param date - Date in YYYY-MM-DD format
+   * @param sellerId - Seller ID from Mercado Libre
    */
+  async getAuditSummary(
+    date: string,
+    sellerId: number,
+  ): Promise<AuditSummaryResponseDto> {
+    const { start, end } = this.getMLDateBoundaries(date);
+
+    // Get all orders for this date/seller (id, status, logistic_type, date_approved)
+    const orders = await this.orderRepository
+      .createQueryBuilder('order')
+      .select(['order.id', 'order.status', 'order.logistic_type', 'order.date_approved'])
+      .where('order.sellerId = :sellerId', { sellerId })
+      .andWhere('order.date_approved >= :start', { start })
+      .andWhere('order.date_approved <= :end', { end })
+      .getMany();
+
+    const totalOrders = orders.length;
+
+    if (totalOrders === 0) {
+      return {
+        date,
+        seller_id: sellerId,
+        total_orders: 0,
+        inventory_deducted: 0,
+        fulfillment: 0,
+        not_found: 0,
+        without_audit: 0,
+        pending_mapping: 0,
+        cancelled: 0,
+        tracking_active: true,
+      };
+    }
+
+    const orderIds = orders.map((o) => o.id);
+
+    // Fulfillment orders (by logistic_type) — ML maneja stock, no requieren descuento local
+    const fulfillmentOrders = orders.filter((o) => o.logistic_type === 'fulfillment');
+
+    // Get DISTINCT order_ids that have audits, grouped by their "best" status.
+    // An order with multiple items can have multiple audits. We take the
+    // most relevant status per order: OK_INTERNO > OK_FULL > CANCELLED > NOT_FOUND
+    const auditsPerOrder = await this.productAuditRepository
+      .createQueryBuilder('audit')
+      .select('audit.order_id', 'order_id')
+      .addSelect(`
+        CASE
+          WHEN MAX(CASE WHEN audit.status = 'OK_INTERNO' THEN 1 ELSE 0 END) = 1 THEN 'OK_INTERNO'
+          WHEN MAX(CASE WHEN audit.status = 'OK_FULL' THEN 1 ELSE 0 END) = 1 THEN 'OK_FULL'
+          WHEN MAX(CASE WHEN audit.status = 'CANCELLED' THEN 1 ELSE 0 END) = 1 THEN 'CANCELLED'
+          ELSE 'NOT_FOUND'
+        END
+      `, 'best_status')
+      .where('audit.order_id IN (:...orderIds)', { orderIds })
+      .groupBy('audit.order_id')
+      .getRawMany();
+
+    // Build a set of order_ids that have any audit
+    const auditedOrderIds = new Set(auditsPerOrder.map((r) => Number(r.order_id)));
+
+    // Count by best_status (from audited orders only)
+    const statusCounts: Record<string, number> = {};
+    for (const row of auditsPerOrder) {
+      const status = row.best_status?.trim() || 'NOT_FOUND';
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    }
+
+    // Fulfillment count = ALL orders with logistic_type fulfillment
+    // (regardless of audit status — ML handles their stock)
+    const fulfillmentCount = fulfillmentOrders.length;
+
+    // MIN_APPROVED_DATE: determina si esta fecha está dentro del período de seguimiento
+    // Usamos comparación de strings YYYY-MM-DD para evitar problemas de timezone
+    const minDateStr = (process.env.MIN_APPROVED_DATE || '').substring(0, 10); // '2026-02-02' o ''
+    const trackingActive = !minDateStr || date >= minDateStr;
+
+    if (!trackingActive) {
+      // Fecha anterior a la activación: solo mostrar datos informativos, sin alertas
+      return {
+        date,
+        seller_id: sellerId,
+        total_orders: totalOrders,
+        inventory_deducted: statusCounts['OK_INTERNO'] || 0,
+        fulfillment: fulfillmentCount,
+        not_found: 0,
+        without_audit: 0,
+        pending_mapping: 0,
+        cancelled: statusCounts['CANCELLED'] || 0,
+        tracking_active: false,
+      };
+    }
+
+    // without_audit = orders that are NOT fulfillment AND NOT cancelled AND have NO audit
+    const withoutAudit = orders.filter(
+      (o) =>
+        o.logistic_type !== 'fulfillment' &&
+        o.status !== 'cancelled' &&
+        !auditedOrderIds.has(o.id),
+    ).length;
+
+    // Count pending sales for these order IDs (still pending resolution)
+    const orderIdStrings = orderIds.map(String);
+    const pendingCount = await this.pendingSaleRepository
+      .createQueryBuilder('ps')
+      .where('ps.platform_order_id IN (:...orderIds)', { orderIds: orderIdStrings })
+      .andWhere('ps.status = :status', { status: 'pending' })
+      .getCount();
+
+    return {
+      date,
+      seller_id: sellerId,
+      total_orders: totalOrders,
+      inventory_deducted: statusCounts['OK_INTERNO'] || 0,
+      fulfillment: fulfillmentCount,
+      not_found: statusCounts['NOT_FOUND'] || 0,
+      without_audit: withoutAudit,
+      pending_mapping: pendingCount,
+      cancelled: statusCounts['CANCELLED'] || 0,
+      tracking_active: true,
+    };
+  }
+
+  /**
+   * Get Mercado Libre platform ID (cached).
+   */
+  private async getMlPlatformId(): Promise<number | null> {
+    if (this.mlPlatformId !== null) return this.mlPlatformId;
+    const platformRepo = this.dataSource.getRepository(Platform);
+    const platform = await platformRepo.findOne({
+      where: { platform_name: 'Mercado Libre' },
+    });
+    if (platform) this.mlPlatformId = platform.platform_id;
+    return this.mlPlatformId;
+  }
+
+  /**
+   * Get list of unprocessed orders (sin auditoría) for a date.
+   * Excludes fulfillment and cancelled orders.
+   */
+  async getUnprocessedOrders(
+    date: string,
+    sellerId: number,
+  ): Promise<UnprocessedOrderDto[]> {
+    const { start, end } = this.getMLDateBoundaries(date);
+
+    // MIN_APPROVED_DATE: solo retornar órdenes sin procesar desde la fecha de activación
+    // Comparación simple de strings YYYY-MM-DD para evitar problemas de timezone
+    const minDateStr = (process.env.MIN_APPROVED_DATE || '').substring(0, 10);
+    if (minDateStr && date < minDateStr) {
+      return [];
+    }
+
+    const orders = await this.orderRepository
+      .createQueryBuilder('order')
+      .leftJoinAndSelect('order.items', 'items')
+      .where('order.sellerId = :sellerId', { sellerId })
+      .andWhere('order.date_approved >= :start', { start })
+      .andWhere('order.date_approved <= :end', { end })
+      .andWhere("order.logistic_type != 'fulfillment' OR order.logistic_type IS NULL")
+      .andWhere("order.status != 'cancelled'")
+      .orderBy('order.date_approved', 'DESC')
+      .getMany();
+
+    if (orders.length === 0) return [];
+
+    const orderIds = orders.map((o) => o.id);
+
+    // Find which orders already have audits
+    const auditedRows = await this.productAuditRepository
+      .createQueryBuilder('audit')
+      .select('DISTINCT audit.order_id', 'order_id')
+      .where('audit.order_id IN (:...orderIds)', { orderIds })
+      .getRawMany();
+
+    const auditedSet = new Set(auditedRows.map((r) => Number(r.order_id)));
+
+    return orders
+      .filter((o) => !auditedSet.has(o.id))
+      .map((o) => ({
+        order_id: o.id,
+        date_approved: o.date_approved,
+        status: o.status,
+        total_amount: Number(o.total_amount),
+        logistic_type: o.logistic_type || 'unknown',
+        items:
+          o.items?.map((i) => ({
+            title: i.title,
+            seller_sku: i.seller_sku || '',
+            quantity: i.quantity,
+            unit_price: Number(i.unit_price),
+            thumbnail: i.thumbnail || null,
+          })) || [],
+      }));
+  }
+
+  /**
+   * Reprocess a single missed order: deduct stock + create audits.
+   * Only works if the order has NO existing audits (prevents double-deduction).
+   */
+  async reprocessOrder(
+    orderId: number,
+    sellerId: number,
+  ): Promise<ReprocessResultDto> {
+    const order = await this.orderRepository.findOne({
+      where: { id: orderId, sellerId },
+      relations: ['items'],
+    });
+
+    if (!order) {
+      return {
+        order_id: orderId,
+        status: 'partial',
+        message: 'Orden no encontrada',
+      };
+    }
+
+    // Prevent double-deduction
+    const existingAudit = await this.productAuditRepository.findOne({
+      where: { order_id: orderId },
+    });
+    if (existingAudit) {
+      return {
+        order_id: orderId,
+        status: 'already_processed',
+        message: 'Esta orden ya fue procesada anteriormente',
+      };
+    }
+
+    const platformId = await this.getMlPlatformId();
+    const results: { sku: string; status: string; message: string }[] = [];
+
+    for (const item of order.items || []) {
+      const result = await this.processOrderItemForReprocess(order, item, platformId);
+      results.push(result);
+    }
+
+    const allOk = results.every(
+      (r) => r.status === 'OK_INTERNO' || r.status === 'OK_FULL',
+    );
+
+    return {
+      order_id: orderId,
+      status: allOk ? 'processed' : 'partial',
+      message: allOk
+        ? 'Orden procesada — stock descontado'
+        : 'Algunos items no pudieron ser procesados',
+      items: results,
+    };
+  }
+
+  /**
+   * Reprocess ALL unprocessed orders for a date.
+   */
+  async reprocessAllUnprocessed(
+    date: string,
+    sellerId: number,
+  ): Promise<ReprocessAllResultDto> {
+    const unprocessed = await this.getUnprocessedOrders(date, sellerId);
+    const details: ReprocessResultDto[] = [];
+
+    for (const order of unprocessed) {
+      const result = await this.reprocessOrder(order.order_id, sellerId);
+      details.push(result);
+    }
+
+    return {
+      total: unprocessed.length,
+      processed: details.filter((r) => r.status === 'processed').length,
+      failed: details.filter((r) => r.status === 'partial').length,
+      details,
+    };
+  }
+
+  /**
+   * Process a single order item during reprocessing.
+   * Mirrors NotificationService.handleInventoryAndAudit logic.
+   */
+  private async processOrderItemForReprocess(
+    order: Order,
+    item: OrderItem,
+    platformId: number | null,
+  ): Promise<{ sku: string; status: string; message: string }> {
+    const sku = item.seller_sku || '';
+
+    // Find product by SKU (same lookup chain as webhook)
+    let product: Product | null = null;
+    if (platformId && sku) {
+      product = await this.inventoryService.findProductBySku(platformId, sku);
+    }
+    if (!product && platformId && item.item_id) {
+      product = await this.inventoryService.findProductBySku(platformId, String(item.item_id));
+    }
+
+    // Fallback: direct search by internal_sku
+    if (!product) {
+      const productRepo = this.dataSource.getRepository(Product);
+      product = await productRepo.findOne({
+        where: [
+          ...(sku ? [{ internal_sku: sku }] : []),
+          ...(item.item_id ? [{ internal_sku: String(item.item_id) }] : []),
+        ],
+      });
+    }
+
+    if (!product) {
+      // Create pending sale for manual resolution
+      if (platformId) {
+        try {
+          await this.pendingSalesService.create({
+            platform_id: platformId,
+            platform_order_id: String(order.id),
+            platform_sku: sku || String(item.item_id),
+            quantity: item.quantity,
+            sale_date: order.date_approved,
+            raw_data: {
+              item_id: item.item_id,
+              title: item.title,
+              quantity: item.quantity,
+              order_id: order.id,
+              logistic_type: order.logistic_type,
+            },
+          });
+        } catch {
+          // PendingSale may already exist — not critical
+        }
+      }
+
+      await this.createReprocessAudit(order, sku, item.item_id, 'NOT_FOUND', 0, 'SKU no encontrado en inventario');
+      return { sku: sku || item.item_id, status: 'NOT_FOUND', message: 'SKU no encontrado' };
+    }
+
+    // Fulfillment — shouldn't happen here since we filter them out, but just in case
+    if (order.logistic_type === 'fulfillment') {
+      await this.createReprocessAudit(order, sku, item.item_id, 'OK_FULL', item.quantity);
+      return { sku, status: 'OK_FULL', message: 'Full — ML maneja stock' };
+    }
+
+    // Validate stock availability
+    const hasStock = await this.inventoryService.validateStockAvailability(
+      product.product_id,
+      item.quantity,
+    );
+    if (!hasStock) {
+      await this.createReprocessAudit(
+        order, sku, item.item_id, 'NOT_FOUND', 0,
+        `Stock insuficiente para descontar ${item.quantity} unidad(es)`,
+      );
+      return {
+        sku,
+        status: 'INSUFFICIENT_STOCK',
+        message: `Stock insuficiente (necesita ${item.quantity})`,
+      };
+    }
+
+    // Deduct stock
+    const metadata = {
+      change_type: 'order' as const,
+      changed_by: 'Reproceso manual',
+      change_reason: `Reproceso orden ML #${order.id}`,
+      platform_id: platformId || undefined,
+      platform_order_id: String(order.id),
+    };
+
+    try {
+      await this.inventoryService.deductStock(product.product_id, item.quantity, metadata);
+      await this.createReprocessAudit(order, sku, item.item_id, 'OK_INTERNO', item.quantity);
+      return { sku, status: 'OK_INTERNO', message: `Descontado: ${item.quantity} unidad(es)` };
+    } catch (error) {
+      await this.createReprocessAudit(
+        order, sku, item.item_id, 'NOT_FOUND', 0,
+        `Error descontando stock: ${error.message}`,
+      );
+      return { sku, status: 'ERROR', message: error.message };
+    }
+  }
+
+  /**
+   * Create audit record during reprocessing.
+   */
+  private async createReprocessAudit(
+    order: Order,
+    sellerSku: string,
+    mlSku: string,
+    status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND' | 'CANCELLED',
+    quantity: number,
+    errorMessage?: string,
+  ): Promise<void> {
+    const audit = this.productAuditRepository.create({
+      order_id: order.id,
+      internal_sku: sellerSku,
+      secondary_sku: mlSku,
+      status,
+      quantity_discounted: quantity,
+      error_message: errorMessage || null,
+      logistic_type: order.logistic_type,
+      platform_name: 'Mercado Libre',
+    });
+    await this.productAuditRepository.save(audit);
+  }
+
   /**
    * Process orders in parallel batches for faster sync
    * @param orders - Array of orders to process
@@ -1202,14 +1658,25 @@ export class OrderService {
             }
           }
           console.log(`[Sync] FLEX FREE SHIPPING: Envío ML=$0, Courier cost=${courierCost}, Bonus=${shippingBonus}`);
-        } else if (shipmentCostsData?.gross_amount) {
-          // Normal Flex: gross_amount is the FULL shipping value before any buyer discounts
-          flexShippingIncome = Number(shipmentCostsData.gross_amount);
-          console.log(`[Sync] Flex self_service - gross_amount: ${flexShippingIncome}`);
         } else if (receiverCost > 0) {
-          // Fallback: receiver.cost = what the buyer pays for shipping (shipping income for seller)
+          // Normal Flex: receiverCost is what the buyer ACTUALLY pays for shipping
+          // The difference (gross_amount - receiverCost) is ML's loyal discount (subsidy)
+          // Separating them allows us to show what the seller keeps after a refund
           flexShippingIncome = receiverCost;
-          console.log(`[Sync] Flex self_service - fallback receiverCost: ${flexShippingIncome}`);
+
+          // Extract receiver's loyal discount as shipping bonus (ML subsidy)
+          // This is the amount ML pays on behalf of the buyer (not refunded to ML on cancellation)
+          const receiverDiscounts = shipmentCostsData?.receiver?.discounts || [];
+          for (const discount of receiverDiscounts) {
+            if (discount.promoted_amount) {
+              shippingBonus += Number(discount.promoted_amount) || 0;
+            }
+          }
+          console.log(`[Sync] Flex self_service - buyerPays: ${flexShippingIncome}, mlSubsidy(bonus): ${shippingBonus}, gross: ${shipmentCostsData?.gross_amount}`);
+        } else if (shipmentCostsData?.gross_amount) {
+          // Fallback: use gross_amount if no receiverCost
+          flexShippingIncome = Number(shipmentCostsData.gross_amount);
+          console.log(`[Sync] Flex self_service - fallback gross_amount: ${flexShippingIncome}`);
         } else {
           // Last resort: try base_cost from shipment data, then cost
           flexShippingIncome = Number(shipmentData?.base_cost) || Number(shipmentData?.cost) || 0;
@@ -1218,32 +1685,18 @@ export class OrderService {
         console.log(`[Sync] Buyer discount info: receiver.discounts=${JSON.stringify(shipmentCostsData?.receiver?.discounts)}`);
       }
       // For Centro de Envío (cross_docking, xd_drop_off): ML handles shipping
-      // Seller pays NET = senderCost - ML discounts (shown as "Envíos" in ML billing)
-      // This is NOT "free shipping" even if receiverCost === 0 — ML charges seller through billing
+      // senders[0].cost is ALREADY the NET cost after ML discounts (matches "Envíos" in ML billing)
+      // The "save" field shows how much was discounted, "cost" is the final amount seller pays
+      // DO NOT subtract discounts — the cost field is already net!
       else if (logisticType === 'cross_docking' || logisticType === 'xd_drop_off') {
-        const senderDiscounts = shipmentCostsData?.senders?.[0]?.discounts || [];
-        let totalMLDiscount = 0;
-
-        // Calculate ML's discount on sender cost
-        // Use promoted_amount (exact $) OR rate (%), but NOT both (they represent the same discount)
-        for (const discount of senderDiscounts) {
-          if (discount.promoted_amount) {
-            totalMLDiscount += Number(discount.promoted_amount) || 0;
-          } else if (discount.rate && discount.rate > 0) {
-            // Fallback: use rate * cost if no promoted_amount
-            totalMLDiscount += senderCost * Number(discount.rate);
-          }
-        }
-
-        // NET shipping cost = what ML actually charges the seller (matches ML billing "Envíos")
-        const netSellerCost = Math.max(0, senderCost - totalMLDiscount);
-        shipmentCost = netSellerCost;
+        // senderCost is ALREADY net after ML discounts (confirmed by "save" field in API)
+        shipmentCost = senderCost;
         // No bonus/courier for Centro de Envío — just the net cost that matches ML billing
         shippingBonus = 0;
         courierCost = 0;
 
-        console.log(`[Sync] Centro de Envío (${logisticType}) - gross=${senderCost}, ML discount=${totalMLDiscount}, NET seller pays=${shipmentCost}`);
-        console.log(`[Sync] Centro de Envío - discounts detail: ${JSON.stringify(senderDiscounts)}`);
+        const senderSave = shipmentCostsData?.senders?.[0]?.save || 0;
+        console.log(`[Sync] Centro de Envío (${logisticType}) - seller pays=${shipmentCost} (ML discounted=${senderSave})`);
       }
       // For fulfillment orders (Full): seller pays senders[0].cost (usually $0, ML handles it)
       else if (logisticType === 'fulfillment') {
@@ -1256,7 +1709,7 @@ export class OrderService {
     // Save order - use column names directly for relations (TypeORM upsert doesn't handle relation objects)
     const orderData: any = {
       id: mlOrder.id,
-      date_approved: new Date(mlOrder.date_closed || mlOrder.date_created),
+      date_approved: new Date(mlOrder.date_created || mlOrder.date_closed),
       last_updated: new Date(mlOrder.last_updated || new Date()),
       expiration_date: mlOrder.expiration_date
         ? new Date(mlOrder.expiration_date)
@@ -1276,6 +1729,8 @@ export class OrderService {
       receiver_name: receiverName,
       receiver_phone: receiverPhone,
       receiver_rut: receiverRut,
+      // Estado del envío (para detectar pérdidas en reembolsos post-entrega)
+      shipment_status: shipmentData?.status || null,
     };
 
     // Add buyer using column name directly (TypeORM upsert needs column names, not relation objects)
@@ -1678,6 +2133,157 @@ export class OrderService {
       days_processed: details.length,
       status_changes: statusChangesCount,
       details,
+    };
+  }
+
+  // ─── Discount History ──────────────────────────────────────
+
+  async getDiscountHistory(
+    fromDate: string,
+    toDate: string,
+    sellerId: number,
+  ): Promise<DiscountHistoryResponseDto> {
+    const rangeStart = this.getMLDateBoundaries(fromDate).start;
+    const rangeEnd = this.getMLDateBoundaries(toDate).end;
+
+    const rows: Array<{
+      audit_id: number;
+      order_id: string;
+      internal_sku: string | null;
+      secondary_sku: string | null;
+      logistic_type: string | null;
+      quantity_discounted: number;
+      error_message: string | null;
+      audit_status: string;
+      created_at: string;
+      audit_date: string;
+      pending_status: string | null;
+      resolved_by: string | null;
+      resolved_at: string | null;
+      platform_sku: string | null;
+    }> = await this.dataSource.query(
+      `SELECT
+        pa.audit_id,
+        pa.order_id::text AS order_id,
+        pa.internal_sku,
+        pa.secondary_sku,
+        pa.logistic_type,
+        pa.quantity_discounted,
+        pa.error_message,
+        pa.status AS audit_status,
+        pa.created_at::text AS created_at,
+        DATE(pa.created_at)::text AS audit_date,
+        ps.status AS pending_status,
+        ps.resolved_by,
+        ps.resolved_at::text AS resolved_at,
+        ps.platform_sku
+      FROM product_audits pa
+      JOIN "order" o ON o.id = pa.order_id
+      LEFT JOIN pending_sales ps
+        ON ps.platform_order_id = pa.order_id::text
+        AND ps.platform_sku = pa.secondary_sku
+      WHERE o."sellerId" = $1
+        AND pa.created_at >= $2
+        AND pa.created_at <= $3
+        AND (pa.logistic_type IS NULL OR pa.logistic_type != 'fulfillment')
+        AND pa.status != 'OK_FULL'
+      ORDER BY pa.created_at DESC`,
+      [sellerId, rangeStart, rangeEnd],
+    );
+
+    // Group by day
+    const dayMap = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const date = row.audit_date;
+      if (!dayMap.has(date)) dayMap.set(date, []);
+      dayMap.get(date)!.push(row);
+    }
+
+    const emptySummary = (): DiscountHistoryDaySummaryDto => ({
+      total_items: 0,
+      discounted_count: 0,
+      pending_count: 0,
+      resolved_count: 0,
+      ignored_count: 0,
+      cancelled_count: 0,
+    });
+
+    const emptyLogisticData = (): DiscountHistoryLogisticDataDto => ({
+      summary: emptySummary(),
+      items: [],
+    });
+
+    const mapStatus = (auditStatus: string, pendingStatus: string | null): DiscountStatus => {
+      if (auditStatus === 'OK_INTERNO') return 'discounted';
+      if (auditStatus === 'CANCELLED') return 'cancelled';
+      // NOT_FOUND
+      if (pendingStatus === 'mapped') return 'resolved';
+      if (pendingStatus === 'ignored') return 'ignored';
+      return 'pending';
+    };
+
+    const mapLogisticGroup = (logisticType: string | null): LogisticGroup => {
+      return (logisticType === 'self_service' || logisticType === 'self_service_cost') ? 'flex' : 'centro_envio';
+    };
+
+    const addToSummary = (summary: DiscountHistoryDaySummaryDto, status: DiscountStatus) => {
+      summary.total_items++;
+      if (status === 'discounted') summary.discounted_count++;
+      else if (status === 'pending') summary.pending_count++;
+      else if (status === 'resolved') summary.resolved_count++;
+      else if (status === 'ignored') summary.ignored_count++;
+      else if (status === 'cancelled') summary.cancelled_count++;
+    };
+
+    const totals = emptySummary();
+    const days: DiscountHistoryDayDto[] = [];
+
+    // Sort dates descending
+    const sortedDates = Array.from(dayMap.keys()).sort((a, b) => b.localeCompare(a));
+
+    for (const date of sortedDates) {
+      const dayRows = dayMap.get(date)!;
+      const daySummary = emptySummary();
+      const flex = emptyLogisticData();
+      const centroEnvio = emptyLogisticData();
+
+      for (const row of dayRows) {
+        const status = mapStatus(row.audit_status, row.pending_status);
+        const group = mapLogisticGroup(row.logistic_type);
+
+        const item: DiscountHistoryItemDto = {
+          order_id: Number(row.order_id),
+          internal_sku: row.internal_sku,
+          platform_sku: row.platform_sku || row.secondary_sku,
+          quantity: row.quantity_discounted,
+          status,
+          logistic_group: group,
+          error_message: row.error_message,
+          resolved_by: row.resolved_by,
+          resolved_at: row.resolved_at,
+          created_at: row.created_at,
+        };
+
+        const target = group === 'flex' ? flex : centroEnvio;
+        target.items.push(item);
+        addToSummary(target.summary, status);
+        addToSummary(daySummary, status);
+        addToSummary(totals, status);
+      }
+
+      days.push({
+        date,
+        summary: daySummary,
+        by_logistic_group: { flex, centro_envio: centroEnvio },
+      });
+    }
+
+    return {
+      from_date: fromDate,
+      to_date: toDate,
+      seller_id: sellerId,
+      days,
+      totals,
     };
   }
 }

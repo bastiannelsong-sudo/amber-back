@@ -1,6 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, Repository, DataSource } from 'typeorm';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Notification } from './entities/notification.entity';
 import { HttpService } from '@nestjs/axios';
 import { AxiosResponse } from 'axios';
@@ -13,15 +14,19 @@ import { Payment } from 'src/orders/entities/payment.entity';
 import { OrderItem } from 'src/orders/entities/order-item.entity';
 import { ProductAudit } from './entities/product-audit.entity';
 import { Product } from '../products/entities/product.entity';
+import { InventoryService } from '../products/services/inventory.service';
+import { PendingSalesService } from './services/pending-sales.service';
+import { Platform } from '../products/entities/platform.entity';
 
 
 @Injectable()
 export class NotificationService {
+  private readonly logger = new Logger(NotificationService.name);
   private readonly clientId: string;
   private readonly clientSecret: string;
   private readonly apiUrl: string;
 
-
+  private mlPlatformId: number | null = null;
   private refreshAttemptCount: number = 0;
 
   constructor(
@@ -43,9 +48,13 @@ export class NotificationService {
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
 
+    private readonly dataSource: DataSource,
+    private readonly inventoryService: InventoryService,
+    private readonly pendingSalesService: PendingSalesService,
 
     private readonly httpService: HttpService,
     private configService: ConfigService,
+    private readonly eventEmitter: EventEmitter2,
 
   ) {
     this.clientId = this.configService.get<string>('CLIENT_ID');
@@ -57,18 +66,33 @@ export class NotificationService {
         'Faltan las variables de configuración necesarias (CLIENT_ID, CLIENT_SECRET)',
       );
     }
+  }
 
-    console.log('CLIENT_ID:', this.clientId);
-    console.log('CLIENT_SECRET:', this.clientSecret);
+  /**
+   * Obtener el platform_id de Mercado Libre (cached)
+   */
+  private async getMlPlatformId(): Promise<number | null> {
+    if (this.mlPlatformId !== null) return this.mlPlatformId;
+
+    const platformRepo = this.dataSource.getRepository(Platform);
+    const platform = await platformRepo.findOne({
+      where: { platform_name: 'Mercado Libre' },
+    });
+
+    if (platform) {
+      this.mlPlatformId = platform.platform_id;
+    }
+
+    return this.mlPlatformId;
   }
 
   async saveNotification(data: Partial<Notification>): Promise<Notification> {
     const existingNotification = await this.notificationRepository.findOne({
-      where: { id: data.id }, // Si la notificación tiene un ID único
+      where: { id: data.id },
     });
 
     if (existingNotification) {
-      return existingNotification; // Si ya existe, no la guardes de nuevo
+      return existingNotification;
     }
 
     const notification = this.notificationRepository.create(data);
@@ -93,12 +117,62 @@ export class NotificationService {
 
       await this.processOrder(orderDetails);
 
+      // Enriquecer notificacion con datos de la orden
+      this.enrichNotification(notification, orderDetails);
+
       notification.processed = true;
       await this.notificationRepository.save(notification);
+
+      // Emitir evento SSE para clientes conectados
+      this.eventEmitter.emit('notification.processed', {
+        id: notification.id,
+        event_type: notification.event_type,
+        summary: notification.summary,
+        product_name: notification.product_name,
+        seller_sku: notification.seller_sku,
+        total_amount: notification.total_amount,
+        currency_id: notification.currency_id,
+        order_id: notification.order_id,
+        order_status: notification.order_status,
+        topic: notification.topic,
+        received: notification.received,
+      });
 
       console.log('Orden y detalles guardados correctamente.');
     } catch (error) {
       console.error('Error durante el procesamiento de la notificación:', error);
+    }
+  }
+
+  private enrichNotification(notification: Notification, orderDetails: any): void {
+    const firstItem = orderDetails.order_items?.[0];
+
+    notification.order_id = orderDetails.id;
+    notification.order_status = orderDetails.status;
+    notification.total_amount = orderDetails.total_amount;
+    notification.currency_id = orderDetails.currency_id;
+    notification.product_name = firstItem?.item?.title || null;
+    notification.seller_sku = firstItem?.item?.seller_sku || null;
+
+    if (orderDetails.status === 'cancelled') {
+      notification.event_type = 'order_cancelled';
+    } else {
+      notification.event_type = 'new_order';
+    }
+
+    const quantity = firstItem?.quantity || 0;
+    const productName = notification.product_name || 'Producto desconocido';
+    const amount = notification.total_amount
+      ? `$${Number(notification.total_amount).toLocaleString('es-CL')}`
+      : '';
+    const extraItems = orderDetails.order_items?.length > 1
+      ? ` (+${orderDetails.order_items.length - 1} mas)`
+      : '';
+
+    if (notification.event_type === 'order_cancelled') {
+      notification.summary = `Orden cancelada: ${productName} x${quantity}${extraItems} - ${amount}`;
+    } else {
+      notification.summary = `Nueva venta: ${productName} x${quantity}${extraItems} - ${amount}`;
     }
   }
 
@@ -135,7 +209,6 @@ export class NotificationService {
     return this.isApprovedDateValid(approvedPayments[0].date_approved);
   }
 
-// ✅ Valida la fecha de aprobación del pago
   private isApprovedDateValid(dateApproved: string): boolean {
     const approvedDate = new Date(dateApproved);
     const minApprovedDate = new Date(process.env.MIN_APPROVED_DATE || '');
@@ -205,7 +278,6 @@ export class NotificationService {
     });
 
     if (!order) {
-      // Si la orden no existe, se crea una nueva
       order = this.orderRepository.create({
         id: orderDetails.id,
         date_approved : new Date(orderDetails.date_approved ?? orderDetails.date_created),
@@ -223,7 +295,6 @@ export class NotificationService {
         pack_id:orderDetails.pack_id,
       });
 
-
       const shippingId = orderDetails.shipping?.id;
       if (shippingId) {
         order.shipping_id = shippingId;
@@ -235,9 +306,7 @@ export class NotificationService {
         }
       }
     } else {
-
       order.date_approved = new Date(orderDetails.date_approved ?? orderDetails.date_created);
-
       order.last_updated = new Date(orderDetails.last_updated);
       order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
       order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
@@ -251,7 +320,6 @@ export class NotificationService {
       order.fulfilled = orderDetails.fulfilled ?? false;
       order.pack_id = orderDetails.pack_id;
 
-      // Si el shipping_id ha cambiado, llamamos a la API para obtener el logistic_type
       const shippingId = orderDetails.shipping?.id;
       if (shippingId && shippingId !== order.shipping_id) {
         order.shipping_id = shippingId;
@@ -260,14 +328,12 @@ export class NotificationService {
           order.logistic_type = logisticType;
         } catch (error) {
           console.error('Error al obtener logistic_type:', error.message);
-          order.logistic_type = 'Unknown'; // Asignamos un valor por defecto en caso de error
+          order.logistic_type = 'Unknown';
         }
       }
     }
 
-    // Guardar la orden en la base de datos
     await this.orderRepository.save(order);
-
     return order;
   }
 
@@ -320,11 +386,9 @@ export class NotificationService {
           }
         }
 
-
         return orderItem;
       })
     );
-
 
     await this.orderItemRepository.save(items);
   }
@@ -333,49 +397,83 @@ export class NotificationService {
     const { item, quantity } = itemDetail;
     const { seller_sku, id: mlSku } = item;
 
-    const product = await this.findProduct(seller_sku, mlSku);
-    if (!product) {
-      return this.createAudit(order, seller_sku, mlSku, 'NOT_FOUND', 0, 'SKU no encontrado en el inventario');
-    }
-
+    // Fulfillment orders never deduct stock or create pending sales
     if (order.logistic_type === 'fulfillment') {
-      return this.createAudit(order, seller_sku, mlSku, 'OK_FULL', product.secondarySkus[0].stock_quantity);
+      return this.createAudit(order, seller_sku, String(mlSku), 'OK_FULL', quantity);
     }
 
-    const { quantityDiscounted, status, errorMessage } = this.processStockUpdate(order, product, quantity);
-    await this.productRepository.save(product);
-    await this.createAudit(order, seller_sku, mlSku, status, quantityDiscounted, errorMessage);
-  }
+    const platformId = await this.getMlPlatformId();
 
-  private async findProduct(seller_sku: string, mlSku: string): Promise<Product | null> {
-    return this.productRepository.findOne({
-      where: [{ internal_sku: seller_sku }, { internal_sku: mlSku }],
-      relations: ['secondarySkus'],
-    });
-  }
+    let product: Product | null = null;
+    if (platformId) {
+      product = await this.inventoryService.findProductBySku(platformId, seller_sku);
+      if (!product && mlSku) {
+        product = await this.inventoryService.findProductBySku(platformId, String(mlSku));
+      }
+    }
 
-  private processStockUpdate(
-    order: Order,
-    product: Product,
-    quantity: number
-  ): { quantityDiscounted: number; status: 'OK_INTERNO' | 'OK_FULL' | 'NOT_FOUND' | 'CANCELLED'; errorMessage?: string } {
-    const stockItem = product.secondarySkus[0];
+    if (!product) {
+      product = await this.productRepository.findOne({
+        where: [{ internal_sku: seller_sku }, { internal_sku: String(mlSku) }],
+        relations: ['secondarySkus'],
+      });
+    }
+
+    if (!product) {
+      if (platformId) {
+        try {
+          await this.pendingSalesService.create({
+            platform_id: platformId,
+            platform_order_id: String(order.id),
+            platform_sku: seller_sku || String(mlSku),
+            quantity: quantity,
+            sale_date: order.date_approved,
+            raw_data: { item, quantity, order_id: order.id, logistic_type: order.logistic_type },
+          });
+          this.logger.log(`PendingSale creado para orden ${order.id}, SKU: ${seller_sku || mlSku}`);
+        } catch (error) {
+          this.logger.warn(`No se pudo crear PendingSale para orden ${order.id}: ${error.message}`);
+        }
+      }
+
+      return this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, 'SKU no encontrado en el inventario');
+    }
+
+    const metadata = {
+      change_type: 'order' as const,
+      changed_by: 'Sistema ML',
+      change_reason: order.status === 'cancelled'
+        ? `Cancelación orden ML #${order.id} - stock restaurado`
+        : `Venta orden ML #${order.id}`,
+      platform_id: platformId || undefined,
+      platform_order_id: String(order.id),
+      metadata: { logistic_type: order.logistic_type },
+    };
 
     if (order.status === 'cancelled') {
-      product.stock += stockItem.stock_quantity * quantity;
-      return { quantityDiscounted: -(stockItem.stock_quantity * quantity), status: 'CANCELLED' };
+      try {
+        await this.inventoryService.restoreStock(product.product_id, quantity, metadata);
+        await this.createAudit(order, seller_sku, String(mlSku), 'CANCELLED', -quantity);
+      } catch (error) {
+        this.logger.error(`Error restaurando stock para orden ${order.id}: ${error.message}`);
+        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error restaurando stock: ${error.message}`);
+      }
+      return;
     }
 
-    if (product.stock >= stockItem.stock_quantity * quantity) {
-      product.stock -= stockItem.stock_quantity * quantity;
-      return { quantityDiscounted: stockItem.stock_quantity * quantity, status: 'OK_INTERNO' };
+    const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, quantity);
+    if (!hasStock) {
+      await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Stock insuficiente para descontar ${quantity} unidades`);
+      return;
     }
 
-    return {
-      quantityDiscounted: 0,
-      status: 'NOT_FOUND',
-      errorMessage: `Stock insuficiente: ${stockItem.stock_quantity * quantity}`,
-    };
+    try {
+      await this.inventoryService.deductStock(product.product_id, quantity, metadata);
+      await this.createAudit(order, seller_sku, String(mlSku), 'OK_INTERNO', quantity);
+    } catch (error) {
+      this.logger.error(`Error descontando stock para orden ${order.id}: ${error.message}`);
+      await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
+    }
   }
 
 
@@ -401,30 +499,20 @@ export class NotificationService {
     await this.productAuditRepository.save(audit);
   }
 
-
-
-  /**
-   * Extract IVA from a price that includes IVA (19% in Chile)
-   * Formula: iva = price - (price / 1.19) = price * 19 / 119
-   */
   private extractIva(priceWithIva: number): number {
     const IVA_RATE = 19;
-    const IVA_DIVISOR = 100 + IVA_RATE; // 119
+    const IVA_DIVISOR = 100 + IVA_RATE;
     return Math.round((priceWithIva * IVA_RATE) / IVA_DIVISOR);
   }
 
   private async savePayments(payments: any[], order: Order): Promise<void> {
-    // Log all payment data to see what ML returns
     console.log(`[NotificationService] Payments for order ${order.id}:`, JSON.stringify(payments, null, 2));
 
     const paymentPromises = payments.map(async (paymentDetail: any) => {
       let payment = await this.paymentRepository.findOne({ where: { id: paymentDetail.id } });
 
-      // Calculate IVA from transaction amount (19% Chilean tax)
       const transactionAmount = paymentDetail.transaction_amount || 0;
       const ivaAmount = this.extractIva(transactionAmount);
-
-      // marketplace_fee comes directly from ML payment data (individual order endpoint)
       const finalMarketplaceFee = paymentDetail.marketplace_fee || 0;
       console.log(`[NotificationService] Order ${order.id}: marketplace_fee=${finalMarketplaceFee}, shipping=${paymentDetail.shipping_cost}`);
 
@@ -462,9 +550,6 @@ export class NotificationService {
     await this.paymentRepository.save(await Promise.all(paymentPromises));
   }
 
-  /**
-   * Fetch billing info from Mercado Libre API to get marketplace fees
-   */
   private async getOrderBillingInfo(order: Order): Promise<any> {
     try {
       const session = await this.sessionRepository.findOne({
@@ -491,35 +576,25 @@ export class NotificationService {
     }
   }
 
-  /**
-   * Extract marketplace fee from billing info response
-   */
   private extractMarketplaceFee(billingInfo: any): number {
-    // Log full billing info structure for debugging
     console.log(`[NotificationService] Full billing info:`, JSON.stringify(billingInfo, null, 2));
 
     if (!billingInfo) {
       return 0;
     }
 
-    // Try different possible structures in ML billing info response
-    // Structure 1: billing_info.details array
     if (billingInfo.billing_info?.details) {
       const details = billingInfo.billing_info.details;
       let totalFee = 0;
-
       for (const detail of details) {
-        // Look for marketplace fee types
         if (detail.type === 'fee' || detail.type === 'marketplace_fee' ||
             detail.type === 'ml_fee' || detail.type === 'sale_fee') {
           totalFee += Math.abs(detail.amount || 0);
         }
       }
-
       if (totalFee > 0) return totalFee;
     }
 
-    // Structure 2: Direct fees array
     if (billingInfo.fees) {
       let totalFee = 0;
       for (const fee of billingInfo.fees) {
@@ -528,7 +603,6 @@ export class NotificationService {
       if (totalFee > 0) return totalFee;
     }
 
-    // Structure 3: sale_fee or marketplace_fee direct property
     if (billingInfo.sale_fee) {
       return Math.abs(billingInfo.sale_fee);
     }
@@ -536,7 +610,6 @@ export class NotificationService {
       return Math.abs(billingInfo.marketplace_fee);
     }
 
-    // Structure 4: billing_info with transactions
     if (billingInfo.billing_info?.transactions) {
       let totalFee = 0;
       for (const transaction of billingInfo.billing_info.transactions) {
@@ -549,9 +622,6 @@ export class NotificationService {
 
     return 0;
   }
-
-
-
 
   private async getOrderDetails(notification: Notification): Promise<any> {
     let session: Session | null = null;
@@ -593,9 +663,8 @@ export class NotificationService {
   private async getLogisticType(order: Order): Promise<string> {
     let session: Session | null = null;
     try {
-
-       session = await this.sessionRepository.findOne({
-        where: { user_id: order.seller.id  },
+      session = await this.sessionRepository.findOne({
+        where: { user_id: order.seller.id },
       });
 
       if (!session) {
@@ -603,11 +672,7 @@ export class NotificationService {
         return 'Unknown';
       }
 
-      
       const accessToken = session.access_token;
-      console.log('Intentando acceder con el token:', accessToken);
-
-  
       const response: AxiosResponse = await firstValueFrom(
         this.httpService.get(`https://api.mercadolibre.com/orders/${order.id}/shipments`, {
           headers: {
@@ -615,13 +680,11 @@ export class NotificationService {
           },
         }),
       );
-      
+
       return response.data.logistic_type;
     } catch (error) {
-     
-        console.error('Error al obtener logistic_type:', error.message);
-        return 'Unknown'; 
-      
+      console.error('Error al obtener logistic_type:', error.message);
+      return 'Unknown';
     }
   }
 
@@ -647,11 +710,11 @@ export class NotificationService {
         access_token: newTokens.access_token,
         expires_in: newTokens.expires_in,
         refresh_token: newTokens.refresh_token,
-        updated_at: new Date(), // Establecer manualmente la fecha de actualización
+        updated_at: new Date(),
       });
 
       this.refreshAttemptCount = 0;
-      return this.getOrderDetails(notification); // Intentar nuevamente con el nuevo token
+      return this.getOrderDetails(notification);
     } catch (refreshError) {
       console.error('No se pudo refrescar el token:', refreshError.message);
       return { error: 'Error al refrescar el token' };
@@ -677,13 +740,69 @@ export class NotificationService {
     } catch (error) {
       console.error('Error al obtener nuevo access_token:', error.message);
     }
-
-
   }
 
+  // === Metodos de consulta para notificaciones ===
 
+  async findRecent(limit: number): Promise<Notification[]> {
+    return this.notificationRepository.find({
+      where: { processed: true },
+      order: { received: 'DESC' },
+      take: limit,
+    });
+  }
 
+  async countUnread(): Promise<number> {
+    return this.notificationRepository.count({
+      where: { read: false, processed: true },
+    });
+  }
 
+  async findHistory(
+    page: number,
+    limit: number,
+    fromDate?: string,
+    toDate?: string,
+  ): Promise<{
+    data: Notification[];
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+  }> {
+    const qb = this.notificationRepository.createQueryBuilder('n');
+    qb.where('n.processed = :processed', { processed: true });
 
+    if (fromDate) {
+      qb.andWhere('n.received >= :fromDate', { fromDate: new Date(fromDate) });
+    }
+    if (toDate) {
+      const toDatePlusOne = new Date(toDate);
+      toDatePlusOne.setDate(toDatePlusOne.getDate() + 1);
+      qb.andWhere('n.received < :toDate', { toDate: toDatePlusOne });
+    }
+
+    qb.orderBy('n.received', 'DESC');
+    const total = await qb.getCount();
+    const totalPages = Math.ceil(total / limit);
+    qb.skip((page - 1) * limit).take(limit);
+    const data = await qb.getMany();
+
+    return { data, total, page: Number(page), limit: Number(limit), totalPages };
+  }
+
+  async markAsRead(id: string): Promise<void> {
+    await this.notificationRepository.update(id, {
+      read: true,
+      read_at: new Date(),
+    });
+  }
+
+  async markAllAsRead(): Promise<number> {
+    const result = await this.notificationRepository.update(
+      { read: false },
+      { read: true, read_at: new Date() },
+    );
+    return result.affected || 0;
+  }
 }
-

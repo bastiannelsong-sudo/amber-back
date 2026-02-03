@@ -69,35 +69,47 @@ export class PendingSalesService {
   async resolve(id: number, dto: ResolvePendingSaleDto): Promise<PendingSale> {
     const sale = await this.findById(id);
 
-    // Descontar stock
-    await this.inventoryService.deductStock(dto.product_id, sale.quantity, {
-      change_type: 'order',
-      changed_by: dto.resolved_by,
-      change_reason: `Venta pendiente resuelta - Orden ${sale.platform_order_id}`,
-      platform_id: sale.platform_id,
-      platform_order_id: sale.platform_order_id,
-      adjustment_amount: -sale.quantity,
-      metadata: { pending_sale_id: id, ...sale.raw_data },
-    });
+    // Normalizar: soportar items[] (nuevo) o product_id (legacy)
+    const items = dto.items && dto.items.length > 0
+      ? dto.items
+      : dto.product_id
+        ? [{ product_id: dto.product_id, quantity: sale.quantity }]
+        : [];
 
-    // Crear mapeo si se solicitó
+    if (items.length === 0) {
+      throw new Error('Debe especificar al menos un producto');
+    }
+
+    // Descontar stock de cada producto
+    for (const item of items) {
+      await this.inventoryService.deductStock(item.product_id, item.quantity, {
+        change_type: 'order',
+        changed_by: dto.resolved_by,
+        change_reason: `Venta pendiente resuelta - Orden ${sale.platform_order_id}`,
+        platform_id: sale.platform_id,
+        platform_order_id: sale.platform_order_id,
+        adjustment_amount: -item.quantity,
+        metadata: { pending_sale_id: id, ...sale.raw_data },
+      });
+    }
+
+    // Crear mapeo si se solicitó (usa el primer producto)
     if (dto.create_mapping) {
       try {
         await this.mappingService.create({
           platform_id: sale.platform_id,
           platform_sku: sale.platform_sku,
-          product_id: dto.product_id,
+          product_id: items[0].product_id,
           created_by: dto.resolved_by,
         });
       } catch (error) {
-        // Si ya existe el mapeo, no es un error crítico
         this.logger.warn(`Mapeo ya existe o no se pudo crear: ${error.message}`);
       }
     }
 
     // Actualizar venta pendiente
     sale.status = PendingSaleStatus.MAPPED;
-    sale.mapped_to_product_id = dto.product_id;
+    sale.mapped_to_product_id = items[0].product_id;
     sale.resolved_by = dto.resolved_by;
     sale.resolved_at = new Date();
 

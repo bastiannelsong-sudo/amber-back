@@ -3,6 +3,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { NotificationService } from './notification.service';
 import { NotificationController } from './notification.controller';
 import { NotificationGateway } from './notification.gateway';
+import { FalabellaNotificationController } from './falabella-notification.controller';
+import { FalabellaNotificationService } from './falabella-notification.service';
 import { Notification } from './entities/notification.entity';
 import { AuthModule } from '../auth/auth.module';
 import { HttpModule } from '@nestjs/axios';
@@ -24,8 +26,8 @@ import { InventoryModule } from '../inventory/inventory.module';
     HttpModule,
     InventoryModule,
   ],
-  controllers: [NotificationController],
-  providers: [NotificationService, NotificationGateway],
+  controllers: [NotificationController, FalabellaNotificationController],
+  providers: [NotificationService, NotificationGateway, FalabellaNotificationService],
   exports: [NotificationGateway]
 })
 export class NotificationModule {}

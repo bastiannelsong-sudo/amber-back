@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Product } from '../products/entities/product.entity';
 import { ProductHistory } from '../products/entities/product-history.entity';
 import { ProductMapping } from '../products/entities/product-mapping.entity';
+import { SecondarySku } from '../products/entities/secondary-sku.entity';
 import { PendingSale } from '../notification/entities/pending-sale.entity';
 import { Platform } from '../products/entities/platform.entity';
 import { InventoryService } from '../products/services/inventory.service';
@@ -17,6 +18,7 @@ import { PendingSalesController } from '../notification/controllers/pending-sale
       Product,
       ProductHistory,
       ProductMapping,
+      SecondarySku,
       PendingSale,
       Platform,
     ]),

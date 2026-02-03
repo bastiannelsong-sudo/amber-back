@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { Product } from '../entities/product.entity';
 import { ProductHistory } from '../entities/product-history.entity';
 import { ProductMapping } from '../entities/product-mapping.entity';
+import { SecondarySku } from '../entities/secondary-sku.entity';
 
 interface StockChangeMetadata {
   platform_id?: number;
@@ -24,6 +25,8 @@ export class InventoryService {
     private historyRepository: Repository<ProductHistory>,
     @InjectRepository(ProductMapping)
     private mappingRepository: Repository<ProductMapping>,
+    @InjectRepository(SecondarySku)
+    private secondarySkuRepository: Repository<SecondarySku>,
   ) {}
 
   /**
@@ -53,7 +56,20 @@ export class InventoryService {
       relations: ['category', 'secondarySkus', 'secondarySkus.platform'],
     });
 
-    return product;
+    if (product) {
+      return product;
+    }
+
+    // Buscar por secondary_sku (para Falabella y otros)
+    const secondarySku = await this.secondarySkuRepository.findOne({
+      where: {
+        secondary_sku: sku,
+        platform: { platform_id: platformId },
+      },
+      relations: ['product', 'product.category', 'product.secondarySkus'],
+    });
+
+    return secondarySku?.product || null;
   }
 
   /**

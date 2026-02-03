@@ -54,14 +54,15 @@ export class ProductsService {
   findAll() {
     return this.productRepository
       .createQueryBuilder('product')
-      .leftJoinAndSelect('product.secondarySkus', 'secondarySkus') // Left join para incluir incluso cuando secondarySkus es null
+      .leftJoinAndSelect('product.secondarySkus', 'secondarySkus')
+      .leftJoinAndSelect('secondarySkus.platform', 'platform')
       .leftJoinAndSelect('product.category', 'category')
       .orderBy('product.product_id', 'ASC')
       .getMany(); // Obtiene todos los productos
   }
 
   findOne(id: number) {
-    return this.productRepository.findOne({ where: { product_id: id }, relations: ['secondarySkus'] });
+    return this.productRepository.findOne({ where: { product_id: id }, relations: ['secondarySkus', 'secondarySkus.platform'] });
   }
 
   /**
@@ -226,6 +227,7 @@ export class ProductsService {
       .createQueryBuilder('product')
       .leftJoinAndSelect('product.category', 'category')
       .leftJoinAndSelect('product.secondarySkus', 'secondarySkus')
+      .leftJoinAndSelect('secondarySkus.platform', 'platform')
       .where('product.stock <= :threshold', { threshold })
       .orderBy('product.stock', 'ASC')
       .getMany();

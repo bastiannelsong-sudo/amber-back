@@ -48,9 +48,17 @@ export class PendingSalesService {
   }
 
   async getCount(status: PendingSaleStatus = PendingSaleStatus.PENDING): Promise<number> {
-    return await this.pendingSaleRepository.count({
-      where: { status },
-    });
+    const qb = this.pendingSaleRepository
+      .createQueryBuilder('pending_sale')
+      .where('pending_sale.status = :status', { status });
+
+    const minDateStr = process.env.MIN_APPROVED_DATE || '';
+    const minDate = new Date(minDateStr);
+    if (!isNaN(minDate.getTime())) {
+      qb.andWhere('pending_sale.sale_date >= :minDate', { minDate });
+    }
+
+    return await qb.getCount();
   }
 
   async findById(id: number): Promise<PendingSale> {
@@ -69,16 +77,7 @@ export class PendingSalesService {
   async resolve(id: number, dto: ResolvePendingSaleDto): Promise<PendingSale> {
     const sale = await this.findById(id);
 
-    // Normalizar: soportar items[] (nuevo) o product_id (legacy)
-    const items = dto.items && dto.items.length > 0
-      ? dto.items
-      : dto.product_id
-        ? [{ product_id: dto.product_id, quantity: sale.quantity }]
-        : [];
-
-    if (items.length === 0) {
-      throw new Error('Debe especificar al menos un producto');
-    }
+    const items = dto.items;
 
     // Descontar stock de cada producto
     for (const item of items) {
@@ -93,17 +92,20 @@ export class PendingSalesService {
       });
     }
 
-    // Crear mapeo si se solicitó (usa el primer producto)
+    // Crear mapeo para CADA producto si se solicitó
     if (dto.create_mapping) {
-      try {
-        await this.mappingService.create({
-          platform_id: sale.platform_id,
-          platform_sku: sale.platform_sku,
-          product_id: items[0].product_id,
-          created_by: dto.resolved_by,
-        });
-      } catch (error) {
-        this.logger.warn(`Mapeo ya existe o no se pudo crear: ${error.message}`);
+      for (const item of items) {
+        try {
+          await this.mappingService.create({
+            platform_id: sale.platform_id,
+            platform_sku: sale.platform_sku,
+            product_id: item.product_id,
+            quantity: item.quantity,
+            created_by: dto.resolved_by,
+          });
+        } catch (error) {
+          this.logger.warn(`Mapeo ya existe o no se pudo crear para producto ${item.product_id}: ${error.message}`);
+        }
       }
     }
 

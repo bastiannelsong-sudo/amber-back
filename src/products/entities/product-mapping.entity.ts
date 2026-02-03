@@ -12,7 +12,7 @@ import { Product } from './product.entity';
 import { Platform } from './platform.entity';
 
 @Entity('product_mappings')
-@Unique(['platform_id', 'platform_sku'])
+@Unique(['platform_id', 'platform_sku', 'product_id'])
 export class ProductMapping {
   @PrimaryGeneratedColumn()
   mapping_id: number;
@@ -25,6 +25,9 @@ export class ProductMapping {
 
   @Column()
   product_id: number;
+
+  @Column({ type: 'int', default: 1 })
+  quantity: number;
 
   @Column({ type: 'boolean', default: true })
   is_active: boolean;

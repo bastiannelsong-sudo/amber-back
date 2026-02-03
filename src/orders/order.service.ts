@@ -38,7 +38,7 @@ import { MercadoLibreService } from '../mercadolibre/mercadolibre.service';
 import { TaxService } from '../products/services/tax.service';
 import { MonthlyFlexCostService } from './monthly-flex-cost.service';
 import { FaztConfigurationService } from './fazt-configuration.service';
-import { InventoryService } from '../products/services/inventory.service';
+import { InventoryService, MappedProduct } from '../products/services/inventory.service';
 import { PendingSalesService } from '../notification/services/pending-sales.service';
 import { Product } from '../products/entities/product.entity';
 import { Platform } from '../products/entities/platform.entity';
@@ -1317,27 +1317,36 @@ export class OrderService {
   ): Promise<{ sku: string; status: string; message: string }> {
     const sku = item.seller_sku || '';
 
-    // Find product by SKU (same lookup chain as webhook)
-    let product: Product | null = null;
-    if (platformId && sku) {
-      product = await this.inventoryService.findProductBySku(platformId, sku);
+    // Fulfillment — shouldn't happen here since we filter them out, but just in case
+    if (order.logistic_type === 'fulfillment') {
+      await this.createReprocessAudit(order, sku, item.item_id, 'OK_FULL', item.quantity);
+      return { sku, status: 'OK_FULL', message: 'Full — ML maneja stock' };
     }
-    if (!product && platformId && item.item_id) {
-      product = await this.inventoryService.findProductBySku(platformId, String(item.item_id));
+
+    // Find mapped products by SKU (may return multiple)
+    let mappedProducts: MappedProduct[] = [];
+    if (platformId && sku) {
+      mappedProducts = await this.inventoryService.findProductsBySku(platformId, sku);
+    }
+    if (mappedProducts.length === 0 && platformId && item.item_id) {
+      mappedProducts = await this.inventoryService.findProductsBySku(platformId, String(item.item_id));
     }
 
     // Fallback: direct search by internal_sku
-    if (!product) {
+    if (mappedProducts.length === 0) {
       const productRepo = this.dataSource.getRepository(Product);
-      product = await productRepo.findOne({
+      const product = await productRepo.findOne({
         where: [
           ...(sku ? [{ internal_sku: sku }] : []),
           ...(item.item_id ? [{ internal_sku: String(item.item_id) }] : []),
         ],
       });
+      if (product) {
+        mappedProducts = [{ product, quantity: 1 }];
+      }
     }
 
-    if (!product) {
+    if (mappedProducts.length === 0) {
       // Create pending sale for manual resolution
       if (platformId) {
         try {
@@ -1364,49 +1373,48 @@ export class OrderService {
       return { sku: sku || item.item_id, status: 'NOT_FOUND', message: 'SKU no encontrado' };
     }
 
-    // Fulfillment — shouldn't happen here since we filter them out, but just in case
-    if (order.logistic_type === 'fulfillment') {
-      await this.createReprocessAudit(order, sku, item.item_id, 'OK_FULL', item.quantity);
-      return { sku, status: 'OK_FULL', message: 'Full — ML maneja stock' };
+    // Validate stock for ALL mapped products
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalNeeded = item.quantity * mappingQty;
+      const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, totalNeeded);
+      if (!hasStock) {
+        await this.createReprocessAudit(
+          order, sku, item.item_id, 'NOT_FOUND', 0,
+          `Stock insuficiente en producto ${product.internal_sku} para descontar ${totalNeeded} unidad(es)`,
+        );
+        return {
+          sku,
+          status: 'INSUFFICIENT_STOCK',
+          message: `Stock insuficiente en ${product.internal_sku} (necesita ${totalNeeded})`,
+        };
+      }
     }
 
-    // Validate stock availability
-    const hasStock = await this.inventoryService.validateStockAvailability(
-      product.product_id,
-      item.quantity,
-    );
-    if (!hasStock) {
-      await this.createReprocessAudit(
-        order, sku, item.item_id, 'NOT_FOUND', 0,
-        `Stock insuficiente para descontar ${item.quantity} unidad(es)`,
-      );
-      return {
-        sku,
-        status: 'INSUFFICIENT_STOCK',
-        message: `Stock insuficiente (necesita ${item.quantity})`,
+    // Deduct stock from ALL mapped products
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalToDeduct = item.quantity * mappingQty;
+      const metadata = {
+        change_type: 'order' as const,
+        changed_by: 'Reproceso manual',
+        change_reason: `Reproceso orden ML #${order.id}`,
+        platform_id: platformId || undefined,
+        platform_order_id: String(order.id),
       };
+
+      try {
+        await this.inventoryService.deductStock(product.product_id, totalToDeduct, metadata);
+        await this.createReprocessAudit(order, sku, item.item_id, 'OK_INTERNO', totalToDeduct);
+      } catch (error) {
+        await this.createReprocessAudit(
+          order, sku, item.item_id, 'NOT_FOUND', 0,
+          `Error descontando stock: ${error.message}`,
+        );
+        return { sku, status: 'ERROR', message: error.message };
+      }
     }
 
-    // Deduct stock
-    const metadata = {
-      change_type: 'order' as const,
-      changed_by: 'Reproceso manual',
-      change_reason: `Reproceso orden ML #${order.id}`,
-      platform_id: platformId || undefined,
-      platform_order_id: String(order.id),
-    };
-
-    try {
-      await this.inventoryService.deductStock(product.product_id, item.quantity, metadata);
-      await this.createReprocessAudit(order, sku, item.item_id, 'OK_INTERNO', item.quantity);
-      return { sku, status: 'OK_INTERNO', message: `Descontado: ${item.quantity} unidad(es)` };
-    } catch (error) {
-      await this.createReprocessAudit(
-        order, sku, item.item_id, 'NOT_FOUND', 0,
-        `Error descontando stock: ${error.message}`,
-      );
-      return { sku, status: 'ERROR', message: error.message };
-    }
+    const totalDeducted = mappedProducts.reduce((sum, mp) => sum + item.quantity * mp.quantity, 0);
+    return { sku, status: 'OK_INTERNO', message: `Descontado: ${totalDeducted} unidad(es) en ${mappedProducts.length} producto(s)` };
   }
 
   /**
@@ -2185,10 +2193,11 @@ export class OrderService {
       WHERE o."sellerId" = $1
         AND pa.created_at >= $2
         AND pa.created_at <= $3
+        AND ($4::timestamp IS NULL OR o.date_approved >= $4::timestamp)
         AND (pa.logistic_type IS NULL OR pa.logistic_type != 'fulfillment')
         AND pa.status != 'OK_FULL'
       ORDER BY pa.created_at DESC`,
-      [sellerId, rangeStart, rangeEnd],
+      [sellerId, rangeStart, rangeEnd, this.getMinApprovedDate()],
     );
 
     // Group by day
@@ -2285,5 +2294,11 @@ export class OrderService {
       days,
       totals,
     };
+  }
+
+  private getMinApprovedDate(): Date | null {
+    const minDateStr = process.env.MIN_APPROVED_DATE || '';
+    const minDate = new Date(minDateStr);
+    return isNaN(minDate.getTime()) ? null : minDate;
   }
 }

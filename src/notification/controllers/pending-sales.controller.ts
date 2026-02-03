@@ -18,7 +18,7 @@ export class PendingSalesController {
   @Get()
   findAll(
     @Query('status') status?: PendingSaleStatus,
-    @Query('platformId', new ParseIntPipe({ optional: true })) platformId?: number,
+    @Query('platformId') platformId?: number,
   ) {
     return this.pendingSalesService.findAll(status, platformId);
   }

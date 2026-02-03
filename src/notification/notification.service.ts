@@ -14,7 +14,7 @@ import { Payment } from 'src/orders/entities/payment.entity';
 import { OrderItem } from 'src/orders/entities/order-item.entity';
 import { ProductAudit } from './entities/product-audit.entity';
 import { Product } from '../products/entities/product.entity';
-import { InventoryService } from '../products/services/inventory.service';
+import { InventoryService, MappedProduct } from '../products/services/inventory.service';
 import { PendingSalesService } from './services/pending-sales.service';
 import { Platform } from '../products/entities/platform.entity';
 
@@ -404,22 +404,29 @@ export class NotificationService {
 
     const platformId = await this.getMlPlatformId();
 
-    let product: Product | null = null;
+    // Resolver productos mapeados (puede ser multiples)
+    let mappedProducts: MappedProduct[] = [];
+
     if (platformId) {
-      product = await this.inventoryService.findProductBySku(platformId, seller_sku);
-      if (!product && mlSku) {
-        product = await this.inventoryService.findProductBySku(platformId, String(mlSku));
+      mappedProducts = await this.inventoryService.findProductsBySku(platformId, seller_sku);
+      if (mappedProducts.length === 0 && mlSku) {
+        mappedProducts = await this.inventoryService.findProductsBySku(platformId, String(mlSku));
       }
     }
 
-    if (!product) {
-      product = await this.productRepository.findOne({
+    // Fallback: buscar directamente por internal_sku
+    if (mappedProducts.length === 0) {
+      const product = await this.productRepository.findOne({
         where: [{ internal_sku: seller_sku }, { internal_sku: String(mlSku) }],
         relations: ['secondarySkus'],
       });
+      if (product) {
+        mappedProducts = [{ product, quantity: 1 }];
+      }
     }
 
-    if (!product) {
+    // No se encontro ningun producto
+    if (mappedProducts.length === 0) {
       if (platformId) {
         try {
           await this.pendingSalesService.create({
@@ -435,44 +442,74 @@ export class NotificationService {
           this.logger.warn(`No se pudo crear PendingSale para orden ${order.id}: ${error.message}`);
         }
       }
-
       return this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, 'SKU no encontrado en el inventario');
     }
 
-    const metadata = {
-      change_type: 'order' as const,
-      changed_by: 'Sistema ML',
-      change_reason: order.status === 'cancelled'
-        ? `Cancelación orden ML #${order.id} - stock restaurado`
-        : `Venta orden ML #${order.id}`,
-      platform_id: platformId || undefined,
-      platform_order_id: String(order.id),
-      metadata: { logistic_type: order.logistic_type },
-    };
-
+    // Cancelacion: restaurar stock de TODOS los productos mapeados
     if (order.status === 'cancelled') {
-      try {
-        await this.inventoryService.restoreStock(product.product_id, quantity, metadata);
-        await this.createAudit(order, seller_sku, String(mlSku), 'CANCELLED', -quantity);
-      } catch (error) {
-        this.logger.error(`Error restaurando stock para orden ${order.id}: ${error.message}`);
-        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error restaurando stock: ${error.message}`);
+      for (const { product, quantity: mappingQty } of mappedProducts) {
+        const totalToRestore = quantity * mappingQty;
+        const metadata = {
+          change_type: 'order' as const,
+          changed_by: 'Sistema ML',
+          change_reason: `Cancelación orden ML #${order.id} - stock restaurado`,
+          platform_id: platformId || undefined,
+          platform_order_id: String(order.id),
+          metadata: { logistic_type: order.logistic_type },
+        };
+        try {
+          await this.inventoryService.restoreStock(product.product_id, totalToRestore, metadata);
+          await this.createAudit(order, seller_sku, String(mlSku), 'CANCELLED', -totalToRestore);
+        } catch (error) {
+          this.logger.error(`Error restaurando stock producto ${product.product_id}, orden ${order.id}: ${error.message}`);
+          await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error restaurando stock: ${error.message}`);
+        }
       }
       return;
     }
 
-    const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, quantity);
-    if (!hasStock) {
-      await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Stock insuficiente para descontar ${quantity} unidades`);
-      return;
+    // Validar stock de TODOS los productos antes de descontar
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalNeeded = quantity * mappingQty;
+      const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, totalNeeded);
+      if (!hasStock) {
+        if (platformId) {
+          try {
+            await this.pendingSalesService.create({
+              platform_id: platformId,
+              platform_order_id: String(order.id),
+              platform_sku: seller_sku || String(mlSku),
+              quantity: quantity,
+              sale_date: order.date_approved,
+              raw_data: { item, quantity, order_id: order.id, logistic_type: order.logistic_type },
+            });
+          } catch (error) {
+            this.logger.warn(`No se pudo crear PendingSale: ${error.message}`);
+          }
+        }
+        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Stock insuficiente en producto ${product.internal_sku} para descontar ${totalNeeded} unidades`);
+        return;
+      }
     }
 
-    try {
-      await this.inventoryService.deductStock(product.product_id, quantity, metadata);
-      await this.createAudit(order, seller_sku, String(mlSku), 'OK_INTERNO', quantity);
-    } catch (error) {
-      this.logger.error(`Error descontando stock para orden ${order.id}: ${error.message}`);
-      await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
+    // Todo validado: descontar TODOS los productos
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalToDeduct = quantity * mappingQty;
+      const metadata = {
+        change_type: 'order' as const,
+        changed_by: 'Sistema ML',
+        change_reason: `Venta orden ML #${order.id}`,
+        platform_id: platformId || undefined,
+        platform_order_id: String(order.id),
+        metadata: { logistic_type: order.logistic_type },
+      };
+      try {
+        await this.inventoryService.deductStock(product.product_id, totalToDeduct, metadata);
+        await this.createAudit(order, seller_sku, String(mlSku), 'OK_INTERNO', totalToDeduct);
+      } catch (error) {
+        this.logger.error(`Error descontando stock producto ${product.product_id}, orden ${order.id}: ${error.message}`);
+        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
+      }
     }
   }
 

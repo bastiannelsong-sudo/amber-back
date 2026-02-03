@@ -16,6 +16,11 @@ interface StockChangeMetadata {
   metadata?: any;
 }
 
+export interface MappedProduct {
+  product: Product;
+  quantity: number;
+}
+
 @Injectable()
 export class InventoryService {
   constructor(
@@ -30,14 +35,14 @@ export class InventoryService {
   ) {}
 
   /**
-   * Buscar producto por SKU de plataforma o SKU interno
+   * Buscar productos por SKU de plataforma (puede retornar multiples para mappings multi-producto)
    */
-  async findProductBySku(
+  async findProductsBySku(
     platformId: number,
     sku: string,
-  ): Promise<Product | null> {
-    // Primero buscar por mapeo
-    const mapping = await this.mappingRepository.findOne({
+  ): Promise<MappedProduct[]> {
+    // Primero buscar por mapeos (puede haber multiples productos por SKU)
+    const mappings = await this.mappingRepository.find({
       where: {
         platform_id: platformId,
         platform_sku: sku,
@@ -46,8 +51,8 @@ export class InventoryService {
       relations: ['product'],
     });
 
-    if (mapping) {
-      return mapping.product;
+    if (mappings.length > 0) {
+      return mappings.map(m => ({ product: m.product, quantity: m.quantity }));
     }
 
     // Si no hay mapeo, buscar por SKU interno
@@ -57,7 +62,7 @@ export class InventoryService {
     });
 
     if (product) {
-      return product;
+      return [{ product, quantity: 1 }];
     }
 
     // Buscar por secondary_sku (para Falabella y otros)
@@ -69,7 +74,11 @@ export class InventoryService {
       relations: ['product', 'product.category', 'product.secondarySkus'],
     });
 
-    return secondarySku?.product || null;
+    if (secondarySku?.product) {
+      return [{ product: secondarySku.product, quantity: 1 }];
+    }
+
+    return [];
   }
 
   /**

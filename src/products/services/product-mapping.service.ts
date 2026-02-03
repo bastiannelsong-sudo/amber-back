@@ -12,17 +12,18 @@ export class ProductMappingService {
   ) {}
 
   async create(dto: CreateProductMappingDto): Promise<ProductMapping> {
-    // Verificar si ya existe un mapeo para este SKU de plataforma
+    // Verificar si ya existe un mapeo para este SKU + producto en esta plataforma
     const existing = await this.mappingRepository.findOne({
       where: {
         platform_id: dto.platform_id,
         platform_sku: dto.platform_sku,
+        product_id: dto.product_id,
       },
     });
 
     if (existing) {
       throw new ConflictException(
-        `Ya existe un mapeo para el SKU ${dto.platform_sku} en esta plataforma`,
+        `Ya existe un mapeo para el SKU ${dto.platform_sku} con el producto ${dto.product_id} en esta plataforma`,
       );
     }
 
@@ -48,8 +49,8 @@ export class ProductMappingService {
   async findByPlatformSku(
     platformId: number,
     sku: string,
-  ): Promise<ProductMapping | null> {
-    return await this.mappingRepository.findOne({
+  ): Promise<ProductMapping[]> {
+    return await this.mappingRepository.find({
       where: {
         platform_id: platformId,
         platform_sku: sku,

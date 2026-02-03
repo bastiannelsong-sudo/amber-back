@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { ProductAudit } from './entities/product-audit.entity';
 import { Product } from '../products/entities/product.entity';
-import { InventoryService } from '../products/services/inventory.service';
+import { InventoryService, MappedProduct } from '../products/services/inventory.service';
 import { PendingSalesService } from './services/pending-sales.service';
 import { Platform } from '../products/entities/platform.entity';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -99,26 +99,29 @@ export class FalabellaNotificationService {
   ): Promise<any> {
     const { sku, shop_sku, name, quantity } = item;
 
-    // Buscar producto por SKU (product_mappings → internal_sku → secondary_skus)
-    let product: Product | null = null;
+    // Resolver productos mapeados (puede ser multiples)
+    let mappedProducts: MappedProduct[] = [];
 
     if (platformId) {
-      product = await this.inventoryService.findProductBySku(platformId, sku);
-      if (!product && shop_sku) {
-        product = await this.inventoryService.findProductBySku(platformId, shop_sku);
+      mappedProducts = await this.inventoryService.findProductsBySku(platformId, sku);
+      if (mappedProducts.length === 0 && shop_sku) {
+        mappedProducts = await this.inventoryService.findProductsBySku(platformId, shop_sku);
       }
     }
 
     // Fallback: buscar directamente por internal_sku
-    if (!product) {
-      product = await this.productRepository.findOne({
+    if (mappedProducts.length === 0) {
+      const product = await this.productRepository.findOne({
         where: [{ internal_sku: sku }, ...(shop_sku ? [{ internal_sku: shop_sku }] : [])],
         relations: ['secondarySkus'],
       });
+      if (product) {
+        mappedProducts = [{ product, quantity: 1 }];
+      }
     }
 
-    if (!product) {
-      // Crear venta pendiente para resolución manual
+    // No se encontro ningun producto
+    if (mappedProducts.length === 0) {
       if (platformId) {
         try {
           await this.pendingSalesService.create({
@@ -134,37 +137,44 @@ export class FalabellaNotificationService {
           this.logger.warn(`No se pudo crear PendingSale: ${error.message}`);
         }
       }
-
       await this.createAudit(orderId, sku, shop_sku, 'NOT_FOUND', 0, 'SKU no encontrado en el inventario');
       return { sku, status: 'NOT_FOUND' };
     }
 
-    // Validar stock disponible
-    const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, quantity);
-    if (!hasStock) {
-      await this.createAudit(orderId, sku, shop_sku, 'NOT_FOUND', 0, `Stock insuficiente para descontar ${quantity} unidades`);
-      return { sku, status: 'INSUFFICIENT_STOCK' };
+    // Validar stock de TODOS los productos antes de descontar
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalNeeded = quantity * mappingQty;
+      const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, totalNeeded);
+      if (!hasStock) {
+        await this.createAudit(orderId, sku, shop_sku, 'NOT_FOUND', 0, `Stock insuficiente en producto ${product.internal_sku} para descontar ${totalNeeded} unidades`);
+        return { sku, status: 'INSUFFICIENT_STOCK' };
+      }
     }
 
-    // Descontar stock
-    const metadata = {
-      change_type: 'order' as const,
-      changed_by: 'Sistema Falabella',
-      change_reason: `Venta orden Falabella #${orderId}`,
-      platform_id: platformId || undefined,
-      platform_order_id: orderId,
-    };
-
-    try {
-      await this.inventoryService.deductStock(product.product_id, quantity, metadata);
-      await this.createAudit(orderId, sku, shop_sku, 'OK_INTERNO', quantity);
-      this.logger.log(`Stock descontado: producto ${product.internal_sku}, cantidad ${quantity}, orden Falabella ${orderId}`);
-      return { sku, status: 'OK_INTERNO', product_id: product.product_id };
-    } catch (error) {
-      this.logger.error(`Error descontando stock para orden Falabella ${orderId}: ${error.message}`);
-      await this.createAudit(orderId, sku, shop_sku, 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
-      return { sku, status: 'ERROR' };
+    // Todo validado: descontar TODOS los productos
+    const results = [];
+    for (const { product, quantity: mappingQty } of mappedProducts) {
+      const totalToDeduct = quantity * mappingQty;
+      const metadata = {
+        change_type: 'order' as const,
+        changed_by: 'Sistema Falabella',
+        change_reason: `Venta orden Falabella #${orderId}`,
+        platform_id: platformId || undefined,
+        platform_order_id: orderId,
+      };
+      try {
+        await this.inventoryService.deductStock(product.product_id, totalToDeduct, metadata);
+        await this.createAudit(orderId, sku, shop_sku, 'OK_INTERNO', totalToDeduct);
+        this.logger.log(`Stock descontado: producto ${product.internal_sku}, cantidad ${totalToDeduct}, orden Falabella ${orderId}`);
+        results.push({ sku: product.internal_sku, status: 'OK_INTERNO', product_id: product.product_id });
+      } catch (error) {
+        this.logger.error(`Error descontando stock para orden Falabella ${orderId}: ${error.message}`);
+        await this.createAudit(orderId, sku, shop_sku, 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
+        results.push({ sku: product.internal_sku, status: 'ERROR' });
+      }
     }
+
+    return { sku, status: 'OK_INTERNO', products: results };
   }
 
   private async createAudit(

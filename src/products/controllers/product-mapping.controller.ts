@@ -21,8 +21,18 @@ export class ProductMappingController {
     return this.mappingService.create(createDto);
   }
 
+  @Post('bulk')
+  async createBulk(@Body() dtos: CreateProductMappingDto[]) {
+    const results = [];
+    for (const dto of dtos) {
+      const mapping = await this.mappingService.create(dto);
+      results.push(mapping);
+    }
+    return results;
+  }
+
   @Get()
-  findAll(@Query('platformId', new ParseIntPipe({ optional: true })) platformId?: number) {
+  findAll(@Query('platformId') platformId?: number) {
     return this.mappingService.findAll(platformId);
   }
 

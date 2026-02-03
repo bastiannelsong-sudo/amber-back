@@ -13,17 +13,11 @@ export class ResolveItemDto {
 }
 
 export class ResolvePendingSaleDto {
-  // Legacy: single product (backwards compat)
-  @IsNumber()
-  @IsOptional()
-  product_id?: number;
-
-  // New: multiple products with custom quantities
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => ResolveItemDto)
-  @IsOptional()
-  items?: ResolveItemDto[];
+  @IsNotEmpty()
+  items: ResolveItemDto[];
 
   @IsBoolean()
   @IsOptional()

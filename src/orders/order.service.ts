@@ -2170,6 +2170,7 @@ export class OrderService {
       resolved_at: string | null;
       platform_sku: string | null;
       sale_date: string | null;
+      platform_name: string | null;
     }> = await this.dataSource.query(
       `SELECT
         pa.audit_id,
@@ -2186,16 +2187,17 @@ export class OrderService {
         ps.resolved_by,
         ps.resolved_at::text AS resolved_at,
         ps.platform_sku,
-        o.date_approved::text AS sale_date
+        COALESCE(o.date_approved, pa.created_at)::text AS sale_date,
+        pa.platform_name
       FROM product_audits pa
-      JOIN "order" o ON o.id = pa.order_id
+      LEFT JOIN "order" o ON o.id = pa.order_id
       LEFT JOIN pending_sales ps
         ON ps.platform_order_id = pa.order_id::text
         AND ps.platform_sku = pa.secondary_sku
-      WHERE o."sellerId" = $1
-        AND pa.created_at >= $2
+      WHERE pa.created_at >= $2
         AND pa.created_at <= $3
-        AND ($4::timestamp IS NULL OR o.date_approved >= $4::timestamp)
+        AND (o."sellerId" = $1 OR pa.platform_name = 'Falabella')
+        AND ($4::timestamp IS NULL OR COALESCE(o.date_approved, pa.created_at) >= $4::timestamp)
         AND (pa.logistic_type IS NULL OR pa.logistic_type != 'fulfillment')
         AND pa.status != 'OK_FULL'
       ORDER BY pa.created_at DESC`,
@@ -2274,6 +2276,7 @@ export class OrderService {
           resolved_at: row.resolved_at,
           created_at: row.created_at,
           sale_date: row.sale_date,
+          platform_name: row.platform_name,
         };
 
         const target = group === 'flex' ? flex : centroEnvio;

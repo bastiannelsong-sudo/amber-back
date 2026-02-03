@@ -562,6 +562,7 @@ export class DiscountHistoryItemDto {
   resolved_at: string | null;
   created_at: string;
   sale_date: string | null;
+  platform_name: string | null;
 }
 
 export class DiscountHistoryDaySummaryDto {

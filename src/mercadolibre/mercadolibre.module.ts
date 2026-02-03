@@ -5,24 +5,19 @@ import { MercadoLibreController } from './mercadolibre.controller';
 import { ConfigModule } from '@nestjs/config';
 import { Session } from '../auth/entities/session.entity';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { Notification } from '../notification/entities/notification.entity';
-import { Order } from '../orders/entities/order.entity';
-import { User } from '../orders/entities/user.entity';
-import { OrderItem } from '../orders/entities/order-item.entity';
-import { Payment } from '../orders/entities/payment.entity';
-import { ProductAudit } from '../notification/entities/product-audit.entity';
 import { Product } from '../products/entities/product.entity';
+import { SecondarySku } from '../products/entities/secondary-sku.entity';
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
   controllers: [MercadoLibreController],
   imports: [
-    TypeOrmModule.forFeature([Session]), // Registrar las entidades
+    TypeOrmModule.forFeature([Session, Product, SecondarySku]),
     AuthModule,
-    ConfigModule, // Asegura que ConfigModule esté importado
-    HttpModule, // Importar el módulo de HTTP
+    ConfigModule,
+    HttpModule,
   ],
   providers: [MercadoLibreService],
-  exports: [MercadoLibreService], // Exportar para uso en otros módulos
+  exports: [MercadoLibreService],
 })
 export class MercadoLibreModule {}

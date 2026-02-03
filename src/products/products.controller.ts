@@ -111,4 +111,37 @@ export class ProductsController {
       cost_with_iva: this.taxService.addIva(cost),
     };
   }
+
+  @Put(':id/category')
+  changeCategory(
+    @Param('id') id: number,
+    @Body() body: { category_id: number; changed_by?: string },
+  ) {
+    if (!body.category_id) {
+      throw new BadRequestException('Debe proporcionar category_id');
+    }
+    return this.productsService.changeCategory(
+      id,
+      body.category_id,
+      body.changed_by || 'Usuario',
+    );
+  }
+
+  @Put('bulk/category')
+  bulkChangeCategory(
+    @Body()
+    body: { product_ids: number[]; category_id: number; changed_by?: string },
+  ) {
+    if (!body.product_ids || body.product_ids.length === 0) {
+      throw new BadRequestException('Debe proporcionar product_ids');
+    }
+    if (!body.category_id) {
+      throw new BadRequestException('Debe proporcionar category_id');
+    }
+    return this.productsService.bulkChangeCategory(
+      body.product_ids,
+      body.category_id,
+      body.changed_by || 'Usuario',
+    );
+  }
 }

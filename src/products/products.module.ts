@@ -4,6 +4,7 @@ import { ProductsController } from './products.controller';
 import { ProductsService } from './products.service';
 import { Product } from './entities/product.entity';
 import { ProductHistory } from './entities/product-history.entity';
+import { SecondarySku } from './entities/secondary-sku.entity';
 import { PlatformsModule } from './platforms/platforms.module';
 import { CategoriesModule } from './categories/categories.module';
 import { Category } from './entities/category.entity';
@@ -13,7 +14,7 @@ import { TaxService } from './services/tax.service';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Product, Category, Platform, ProductHistory]),
+    TypeOrmModule.forFeature([Product, Category, Platform, ProductHistory, SecondarySku]),
     CategoriesModule,
     PlatformsModule,
   ],

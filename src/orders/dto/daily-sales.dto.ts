@@ -449,9 +449,11 @@ export class AuditSummaryResponseDto {
   inventory_deducted: number; // OK_INTERNO - stock descontado del inventario
   fulfillment: number; // Logistic type fulfillment — ML maneja stock, no requiere descuento local
   not_found: number; // NOT_FOUND - webhook procesó pero SKU no mapeado
-  without_audit: number; // Sin auditoría (excluye full/canceladas) = orden nunca procesada
+  without_audit: number; // Sin auditoría (excluye full/canceladas/null) = orden nunca procesada y requiere atención
   pending_mapping: number; // Ventas pendientes de resolución manual
   cancelled: number; // CANCELLED - órdenes canceladas (stock restaurado)
+  missing_logistics_data: number; // Órdenes sin logistic_type (NULL) - no se pudo obtener info de envío
+  already_mapped: number; // Órdenes cuyas pending_sales ya fueron procesadas/mapeadas
   tracking_active: boolean; // true si la fecha está dentro del período de seguimiento (>= MIN_APPROVED_DATE)
 }
 

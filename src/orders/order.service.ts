@@ -1063,6 +1063,8 @@ export class OrderService {
         without_audit: 0,
         pending_mapping: 0,
         cancelled: 0,
+        missing_logistics_data: 0,
+        already_mapped: 0,
         tracking_active: true,
       };
     }
@@ -1091,7 +1093,8 @@ export class OrderService {
       .getRawMany();
 
     // Build a set of order_ids that have any audit
-    const auditedOrderIds = new Set(auditsPerOrder.map((r) => Number(r.order_id)));
+    // IMPORTANT: Use String for comparison since bigint comes as string from PostgreSQL
+    const auditedOrderIds = new Set(auditsPerOrder.map((r) => String(r.order_id)));
 
     // Count by best_status (from audited orders only)
     const statusCounts: Record<string, number> = {};
@@ -1121,16 +1124,15 @@ export class OrderService {
         without_audit: 0,
         pending_mapping: 0,
         cancelled: statusCounts['CANCELLED'] || 0,
+        missing_logistics_data: 0,
+        already_mapped: 0,
         tracking_active: false,
       };
     }
 
-    // without_audit = orders that are NOT fulfillment AND NOT cancelled AND have NO audit
-    const withoutAudit = orders.filter(
-      (o) =>
-        o.logistic_type !== 'fulfillment' &&
-        o.status !== 'cancelled' &&
-        !auditedOrderIds.has(o.id),
+    // Count orders with missing logistics data (NULL logistic_type)
+    const missingLogisticsData = orders.filter(
+      (o) => o.logistic_type === null || o.logistic_type === undefined,
     ).length;
 
     // Count pending sales for these order IDs (still pending resolution)
@@ -1140,6 +1142,32 @@ export class OrderService {
       .where('ps.platform_order_id IN (:...orderIds)', { orderIds: orderIdStrings })
       .andWhere('ps.status = :status', { status: 'pending' })
       .getCount();
+
+    // Count orders with ANY pending_sale (already being handled in pending-sales page)
+    const alreadyInPendingSalesRows = await this.pendingSaleRepository
+      .createQueryBuilder('ps')
+      .select('DISTINCT ps.platform_order_id', 'order_id')
+      .where('ps.platform_order_id IN (:...orderIds)', { orderIds: orderIdStrings })
+      .getRawMany();
+
+    const alreadyInPendingSalesSet = new Set(alreadyInPendingSalesRows.map((r) => String(r.order_id)));
+    const alreadyInPendingSalesCount = alreadyInPendingSalesSet.size;
+
+    // without_audit = orders that need attention:
+    // - NOT fulfillment (ML handles stock)
+    // - NOT cancelled
+    // - NOT NULL logistic_type (missing data)
+    // - NOT already have ANY audit (if it has audit, webhook processed it)
+    // - NOT already in pending_sales (being handled there)
+    const withoutAudit = orders.filter(
+      (o) =>
+        o.logistic_type !== null &&
+        o.logistic_type !== undefined &&
+        o.logistic_type !== 'fulfillment' &&
+        o.status !== 'cancelled' &&
+        !auditedOrderIds.has(String(o.id)) &&
+        !alreadyInPendingSalesSet.has(String(o.id)),
+    ).length;
 
     return {
       date,
@@ -1151,6 +1179,8 @@ export class OrderService {
       without_audit: withoutAudit,
       pending_mapping: pendingCount,
       cancelled: statusCounts['CANCELLED'] || 0,
+      missing_logistics_data: missingLogisticsData,
+      already_mapped: alreadyInPendingSalesCount,
       tracking_active: true,
     };
   }
@@ -1191,7 +1221,9 @@ export class OrderService {
       .where('order.sellerId = :sellerId', { sellerId })
       .andWhere('order.date_approved >= :start', { start })
       .andWhere('order.date_approved <= :end', { end })
-      .andWhere("order.logistic_type != 'fulfillment' OR order.logistic_type IS NULL")
+      // Excluir: Full, canceladas, y sin datos de logística (NULL = no se pudo obtener info)
+      .andWhere('order.logistic_type IS NOT NULL')
+      .andWhere("order.logistic_type != 'fulfillment'")
       .andWhere("order.status != 'cancelled'")
       .orderBy('order.date_approved', 'DESC')
       .getMany();
@@ -1200,17 +1232,27 @@ export class OrderService {
 
     const orderIds = orders.map((o) => o.id);
 
-    // Find which orders already have audits
+    // Find orders with ANY audit - exclude these (webhook already processed them)
+    // OK_INTERNO = stock deducted, OK_FULL = Full order, NOT_FOUND = SKU not found, CANCELLED = cancelled
     const auditedRows = await this.productAuditRepository
       .createQueryBuilder('audit')
       .select('DISTINCT audit.order_id', 'order_id')
       .where('audit.order_id IN (:...orderIds)', { orderIds })
       .getRawMany();
 
-    const auditedSet = new Set(auditedRows.map((r) => Number(r.order_id)));
+    const auditedSet = new Set(auditedRows.map((r) => String(r.order_id)));
+
+    // Find orders with ANY pending_sale (already being handled in pending-sales page)
+    const processedPendingSales = await this.pendingSaleRepository
+      .createQueryBuilder('ps')
+      .select('DISTINCT ps.platform_order_id', 'order_id')
+      .where('ps.platform_order_id IN (:...orderIds)', { orderIds: orderIds.map(String) })
+      .getRawMany();
+
+    const processedSet = new Set(processedPendingSales.map((r) => String(r.order_id)));
 
     return orders
-      .filter((o) => !auditedSet.has(o.id))
+      .filter((o) => !auditedSet.has(String(o.id)) && !processedSet.has(String(o.id)))
       .map((o) => ({
         order_id: o.id,
         date_approved: o.date_approved,

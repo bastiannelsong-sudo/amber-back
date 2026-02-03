@@ -545,6 +545,308 @@ export class MercadoLibreService {
     }
   }
 
+  // ==================== ITEMS & STOCK ====================
+
+  /**
+   * Normalize item ID to include country prefix (MLC for Chile)
+   * If the ID already has a prefix, return as-is
+   */
+  private normalizeItemId(itemId: string): string {
+    if (!itemId) return itemId;
+    // If already has country prefix (MLC, MLA, MLB, etc.), return as-is
+    if (/^ML[A-Z]/.test(itemId)) {
+      return itemId;
+    }
+    // Add MLC prefix for Chile
+    return `MLC${itemId}`;
+  }
+
+  /**
+   * Get item details by item ID
+   * Returns stock (available_quantity), pictures, price, etc.
+   */
+  async getItem(itemId: string, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}`;
+      console.log(`[MercadoLibreService] Fetching item: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching item ${itemId}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get multiple items at once (up to 20)
+   */
+  async getMultipleItems(itemIds: string[], sellerId: number): Promise<any[]> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      // Normalize all item IDs to include country prefix
+      const normalizedIds = itemIds.map(id => this.normalizeItemId(id));
+
+      // ML API allows up to 20 items per request
+      const results: any[] = [];
+      const chunks = [];
+      for (let i = 0; i < normalizedIds.length; i += 20) {
+        chunks.push(normalizedIds.slice(i, i + 20));
+      }
+
+      for (const chunk of chunks) {
+        const ids = chunk.join(',');
+        const url = `${this.apiUrl}/items?ids=${ids}`;
+        console.log(`[MercadoLibreService] Fetching multiple items: ${chunk.length} items`);
+
+        const response = await firstValueFrom(
+          this.httpService.get(url, {
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+            },
+          })
+        );
+
+        // Response is array of {code, body} objects
+        for (const item of response.data) {
+          if (item.code === 200) {
+            results.push(item.body);
+          } else {
+            console.warn(`[MercadoLibreService] Item ${item.body?.id} returned code ${item.code}`);
+          }
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching multiple items:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Search seller's items by SKU (seller_sku attribute)
+   */
+  async searchItemsBySku(sku: string, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const url = `${this.apiUrl}/users/${sellerId}/items/search?seller_sku=${encodeURIComponent(sku)}`;
+      console.log(`[MercadoLibreService] Searching items by SKU: ${sku}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error searching items by SKU ${sku}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all seller's active items
+   */
+  async getAllSellerItems(sellerId: number): Promise<string[]> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const allItemIds: string[] = [];
+      let offset = 0;
+      const limit = 100;
+      let total = 0;
+
+      do {
+        const url = `${this.apiUrl}/users/${sellerId}/items/search?offset=${offset}&limit=${limit}`;
+        console.log(`[MercadoLibreService] Fetching seller items: offset=${offset}`);
+
+        const response = await firstValueFrom(
+          this.httpService.get(url, {
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+            },
+          })
+        );
+
+        const data = response.data;
+        total = data.paging?.total || 0;
+        const results = data.results || [];
+
+        allItemIds.push(...results);
+        offset += limit;
+      } while (offset < total);
+
+      console.log(`[MercadoLibreService] Total seller items: ${allItemIds.length}`);
+      return allItemIds;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching seller items:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Update item stock in Mercado Libre
+   */
+  async updateItemStock(itemId: string, quantity: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}`;
+      console.log(`[MercadoLibreService] Updating item stock: ${normalizedId} -> ${quantity}`);
+
+      const response = await firstValueFrom(
+        this.httpService.put(
+          url,
+          { available_quantity: quantity },
+          {
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+              'Content-Type': 'application/json',
+            },
+          }
+        )
+      );
+
+      console.log(`[MercadoLibreService] Stock updated successfully for ${itemId}`);
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error updating stock for ${itemId}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Compare local inventory stock with ML stock for all products with ML secondary SKUs
+   */
+  async validateStockWithML(
+    localProducts: Array<{
+      product_id: number;
+      internal_sku: string;
+      name: string;
+      local_stock: number;
+      ml_item_id: string;
+    }>,
+    sellerId: number
+  ): Promise<{
+    matching: any[];
+    discrepancies: any[];
+    errors: any[];
+  }> {
+    const matching: any[] = [];
+    const discrepancies: any[] = [];
+    const errors: any[] = [];
+
+    // Get ML item IDs
+    const itemIds = localProducts.map(p => p.ml_item_id).filter(Boolean);
+
+    if (itemIds.length === 0) {
+      return { matching, discrepancies, errors };
+    }
+
+    try {
+      // Fetch all ML items at once (IDs will be normalized inside getMultipleItems)
+      const mlItems = await this.getMultipleItems(itemIds, sellerId);
+      // Map by full ML ID (with prefix)
+      const mlItemsMap = new Map(mlItems.map(item => [item.id, item]));
+
+      for (const product of localProducts) {
+        // Normalize the local ml_item_id to match the ML API response format
+        const normalizedId = this.normalizeItemId(product.ml_item_id);
+        const mlItem = mlItemsMap.get(normalizedId);
+
+        if (!mlItem) {
+          errors.push({
+            product_id: product.product_id,
+            internal_sku: product.internal_sku,
+            name: product.name,
+            ml_item_id: normalizedId,
+            original_id: product.ml_item_id,
+            error: 'Item no encontrado en Mercado Libre',
+          });
+          continue;
+        }
+
+        const mlStock = mlItem.available_quantity || 0;
+        const localStock = product.local_stock;
+
+        const result = {
+          product_id: product.product_id,
+          internal_sku: product.internal_sku,
+          name: product.name,
+          ml_item_id: normalizedId,
+          ml_title: mlItem.title,
+          local_stock: localStock,
+          ml_stock: mlStock,
+          ml_status: mlItem.status,
+          ml_pictures: mlItem.pictures?.map((p: any) => p.url) || [],
+          ml_price: mlItem.price,
+          ml_permalink: mlItem.permalink,
+        };
+
+        if (localStock === mlStock) {
+          matching.push(result);
+        } else {
+          discrepancies.push({
+            ...result,
+            difference: localStock - mlStock,
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error validating stock:`, error.message);
+      errors.push({ error: error.message });
+    }
+
+    return { matching, discrepancies, errors };
+  }
+
   /**
    * Search orders by pack_id
    * Uses the orders search endpoint with pack filter

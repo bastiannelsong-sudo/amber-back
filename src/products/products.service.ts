@@ -3,6 +3,7 @@ import { Product } from './entities/product.entity';
 import { Repository } from 'typeorm';
 import { Category } from './entities/category.entity';
 import { Platform } from './entities/platform.entity';
+import { SecondarySku } from './entities/secondary-sku.entity';
 import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { CreateProductDto } from './dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -19,6 +20,8 @@ export class ProductsService {
     private categoryRepository: Repository<Category>,
     @InjectRepository(Platform)
     private platformRepository: Repository<Platform>,
+    @InjectRepository(SecondarySku)
+    private secondarySkuRepository: Repository<SecondarySku>,
     private productHistoryService: ProductHistoryService,
   ) {}
 
@@ -62,7 +65,10 @@ export class ProductsService {
   }
 
   findOne(id: number) {
-    return this.productRepository.findOne({ where: { product_id: id }, relations: ['secondarySkus', 'secondarySkus.platform'] });
+    return this.productRepository.findOne({
+      where: { product_id: id },
+      relations: ['secondarySkus', 'secondarySkus.platform', 'category']
+    });
   }
 
   /**
@@ -91,20 +97,33 @@ export class ProductsService {
     const changes = [];
 
     for (const [field, newValue] of Object.entries(updateDto)) {
-      // Ignorar campos de metadata
-      if (['change_reason', 'changed_by', 'secondarySkus'].includes(field)) {
+      // Ignorar campos de metadata y relaciones (category_id se maneja aparte)
+      if (['change_reason', 'changed_by', 'secondarySkus', 'category_id'].includes(field)) {
         continue;
       }
 
       const oldValue = product[field];
 
-      // Solo registrar si cambió
-      if (oldValue !== undefined && oldValue !== newValue) {
+      // Normalizar valores para comparación
+      const normalizeValue = (val: any): string | number | null => {
+        if (val === null || val === undefined) return null;
+        // Si es número o string numérico, convertir a número
+        if (typeof val === 'number' || (typeof val === 'string' && !isNaN(Number(val)) && val.trim() !== '')) {
+          return Number(val);
+        }
+        return String(val).trim();
+      };
+
+      const normalizedOld = normalizeValue(oldValue);
+      const normalizedNew = normalizeValue(newValue);
+
+      // Solo registrar si realmente cambió
+      if (normalizedOld !== undefined && normalizedOld !== normalizedNew) {
         changes.push({
           product_id: id,
           field_name: field,
-          old_value: String(oldValue),
-          new_value: String(newValue),
+          old_value: oldValue != null ? String(oldValue) : '',
+          new_value: newValue != null ? String(newValue) : '',
           changed_by: changedBy,
           change_type: 'manual',
           change_reason: changeReason,
@@ -121,25 +140,66 @@ export class ProductsService {
     const updateData: any = { ...updateDto };
     delete updateData.change_reason;
     delete updateData.changed_by;
+    const secondarySkusData = updateData.secondarySkus;
     delete updateData.secondarySkus;
 
-    // Si se incluye category_id, buscar la categoría
+    // Si se incluye category_id, buscar la categoría y registrar cambio si es diferente
     if (updateDto.category_id) {
-      const category = await this.categoryRepository.findOne({
+      const newCategory = await this.categoryRepository.findOne({
         where: { platform_id: updateDto.category_id },
       });
-      if (!category) {
+      if (!newCategory) {
         throw new NotFoundException('Categoría no encontrada');
       }
-      updateData.category = category;
+
+      // Registrar cambio de categoría si es diferente
+      const oldCategoryId = product.category?.platform_id;
+      if (oldCategoryId !== updateDto.category_id) {
+        await this.productHistoryService.create({
+          product_id: id,
+          field_name: 'category',
+          old_value: product.category?.platform_name || '',
+          new_value: newCategory.platform_name,
+          changed_by: changedBy,
+          change_type: 'manual',
+          change_reason: changeReason,
+        });
+      }
+
+      updateData.category = newCategory;
       delete updateData.category_id;
     }
 
-    // Actualizar producto
+    // Actualizar producto base
     await this.productRepository.save({
       ...product,
       ...updateData,
     });
+
+    // Actualizar SKUs secundarios si se proporcionaron
+    if (secondarySkusData && Array.isArray(secondarySkusData)) {
+      // Eliminar SKUs secundarios existentes
+      await this.secondarySkuRepository.delete({ product: { product_id: id } });
+
+      // Crear nuevos SKUs secundarios
+      for (const skuData of secondarySkusData) {
+        const platform = await this.platformRepository.findOne({
+          where: { platform_id: skuData.platform_id },
+        });
+        if (!platform) {
+          throw new NotFoundException(`Plataforma con ID ${skuData.platform_id} no encontrada`);
+        }
+
+        const newSku = this.secondarySkuRepository.create({
+          secondary_sku: skuData.secondary_sku,
+          stock_quantity: skuData.stock_quantity || 0,
+          publication_link: skuData.publication_link || null,
+          product: { product_id: id },
+          platform: platform,
+        });
+        await this.secondarySkuRepository.save(newSku);
+      }
+    }
 
     // Retornar producto actualizado con relaciones
     return this.findOne(id);
@@ -231,6 +291,77 @@ export class ProductsService {
       .where('product.stock <= :threshold', { threshold })
       .orderBy('product.stock', 'ASC')
       .getMany();
+  }
+
+  /**
+   * Cambiar categoría de un producto
+   */
+  async changeCategory(
+    productId: number,
+    categoryId: number,
+    changedBy: string = 'Usuario',
+  ): Promise<Product> {
+    const product = await this.findOne(productId);
+    if (!product) {
+      throw new NotFoundException(`Producto con ID ${productId} no encontrado`);
+    }
+
+    const newCategory = await this.categoryRepository.findOne({
+      where: { platform_id: categoryId },
+    });
+    if (!newCategory) {
+      throw new NotFoundException(`Categoría con ID ${categoryId} no encontrada`);
+    }
+
+    const oldCategoryName = product.category?.platform_name || 'Sin categoría';
+    const newCategoryName = newCategory.platform_name;
+
+    // Registrar cambio en historial
+    await this.productHistoryService.create({
+      product_id: productId,
+      field_name: 'category',
+      old_value: oldCategoryName,
+      new_value: newCategoryName,
+      changed_by: changedBy,
+      change_type: 'manual',
+      change_reason: `Cambio de categoría: ${oldCategoryName} → ${newCategoryName}`,
+    });
+
+    // Actualizar categoría
+    product.category = newCategory;
+    await this.productRepository.save(product);
+
+    return this.findOne(productId);
+  }
+
+  /**
+   * Cambiar categoría de múltiples productos
+   */
+  async bulkChangeCategory(
+    productIds: number[],
+    categoryId: number,
+    changedBy: string = 'Usuario',
+  ): Promise<{ updated: number; errors: string[] }> {
+    const errors: string[] = [];
+    let updated = 0;
+
+    const newCategory = await this.categoryRepository.findOne({
+      where: { platform_id: categoryId },
+    });
+    if (!newCategory) {
+      throw new NotFoundException(`Categoría con ID ${categoryId} no encontrada`);
+    }
+
+    for (const productId of productIds) {
+      try {
+        await this.changeCategory(productId, categoryId, changedBy);
+        updated++;
+      } catch (error) {
+        errors.push(`Producto ${productId}: ${error.message}`);
+      }
+    }
+
+    return { updated, errors };
   }
 
   // Mantener métodos originales por compatibilidad

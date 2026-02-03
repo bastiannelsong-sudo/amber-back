@@ -2187,7 +2187,7 @@ export class OrderService {
         ps.resolved_by,
         ps.resolved_at::text AS resolved_at,
         ps.platform_sku,
-        COALESCE(o.date_approved, pa.created_at)::text AS sale_date,
+        (COALESCE(o.date_approved, pa.created_at) AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santiago')::text AS sale_date,
         pa.platform_name
       FROM product_audits pa
       LEFT JOIN "order" o ON o.id = pa.order_id

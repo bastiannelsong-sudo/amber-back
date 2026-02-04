@@ -87,7 +87,7 @@ export class MercadoLibreController {
       product_id: sku.product.product_id,
       internal_sku: sku.product.internal_sku,
       name: sku.product.name,
-      local_stock: sku.product.stock, // Stock total del producto
+      local_stock: (sku.product.stock || 0) + (sku.product.stock_bodega || 0), // Stock total (tienda + bodega)
       ml_item_id: sku.secondary_sku, // Este es el MLC... de ML
     }));
 
@@ -143,16 +143,17 @@ export class MercadoLibreController {
     };
 
     for (const sku of secondarySkus) {
+      const totalStock = (sku.product.stock || 0) + (sku.product.stock_bodega || 0);
       try {
         await this.mercadoLibreService.updateItemStock(
           sku.secondary_sku,
-          sku.product.stock,
+          totalStock,
           sellerId,
         );
         results.success.push({
           ml_item_id: sku.secondary_sku,
           internal_sku: sku.product.internal_sku,
-          stock_sent: sku.product.stock,
+          stock_sent: totalStock,
         });
       } catch (error) {
         results.failed.push({
@@ -230,7 +231,7 @@ export class MercadoLibreController {
       }
 
       try {
-        const oldStock = sku.product.stock;
+        const oldStock = (sku.product.stock || 0) + (sku.product.stock_bodega || 0);
         const newStock = mlItem.available_quantity || 0;
         const imageUrl = mlItem.pictures?.[0]?.url || null;
 

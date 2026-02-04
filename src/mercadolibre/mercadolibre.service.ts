@@ -815,7 +815,7 @@ export class MercadoLibreService {
 
         // Check if item has variations and find the specific one by SKU
         let mlStock = mlItem.available_quantity || 0;
-        let variationInfo: { id: number; attributes: string } | null = null;
+        let variationInfo: { id: number; attributes: string; unmatched_variations?: any[] } | null = null;
 
         if (mlItem.variations && mlItem.variations.length > 0) {
           // Try to find the variation that matches the internal SKU
@@ -835,11 +835,20 @@ export class MercadoLibreService {
             };
           } else if (mlItem.variations.length > 1) {
             // Item has variations but we couldn't match by SKU
-            // This means the local SKU doesn't match any seller_custom_field
-            // Mark as having unmatched variations for user awareness
+            // Build detailed list of available variations
+            const variationDetails = mlItem.variations.map((v: any) => ({
+              id: v.id,
+              sku: v.seller_custom_field || '(sin SKU)',
+              stock: v.available_quantity ?? 0,
+              attributes: v.attribute_combinations
+                ?.map((attr: any) => `${attr.name}: ${attr.value_name}`)
+                .join(', ') || '',
+            }));
+
             variationInfo = {
               id: 0,
-              attributes: `⚠️ ${mlItem.variations.length} variaciones sin mapear por SKU`,
+              attributes: `⚠️ ${mlItem.variations.length} variaciones - Stock total: ${mlStock}`,
+              unmatched_variations: variationDetails,
             };
           }
         }

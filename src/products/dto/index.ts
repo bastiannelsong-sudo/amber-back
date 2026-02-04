@@ -14,6 +14,10 @@ export class CreateProductDto {
 
   @IsNumber()
   @IsOptional()
+  stock_bodega?: number;
+
+  @IsNumber()
+  @IsOptional()
   cost?: number;
 
   @IsNumber()

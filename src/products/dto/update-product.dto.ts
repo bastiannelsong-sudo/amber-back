@@ -23,6 +23,10 @@ export class UpdateProductDto {
 
   @IsNumber()
   @IsOptional()
+  stock_bodega?: number;
+
+  @IsNumber()
+  @IsOptional()
   cost?: number;
 
   @IsNumber()

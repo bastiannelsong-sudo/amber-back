@@ -16,6 +16,9 @@ export class Product {
   @Column({ type: 'int' })
   stock: number;
 
+  @Column({ type: 'int', default: 0 })
+  stock_bodega: number;
+
   @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
   cost: number;
 

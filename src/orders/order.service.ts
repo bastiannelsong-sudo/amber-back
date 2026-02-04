@@ -2199,6 +2199,7 @@ export class OrderService {
     const rows: Array<{
       audit_id: number;
       order_id: string;
+      pack_id: string | null;
       internal_sku: string | null;
       secondary_sku: string | null;
       logistic_type: string | null;
@@ -2217,6 +2218,7 @@ export class OrderService {
       `SELECT
         pa.audit_id,
         pa.order_id::text AS order_id,
+        o.pack_id::text AS pack_id,
         pa.internal_sku,
         pa.secondary_sku,
         pa.logistic_type,
@@ -2308,6 +2310,7 @@ export class OrderService {
 
         const item: DiscountHistoryItemDto = {
           order_id: Number(row.order_id),
+          pack_id: row.pack_id ? Number(row.pack_id) : null,
           internal_sku: row.internal_sku,
           platform_sku: row.platform_sku || row.secondary_sku,
           quantity: row.quantity_discounted,

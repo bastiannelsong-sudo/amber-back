@@ -554,6 +554,7 @@ export class GetDiscountHistoryQueryDto {
 
 export class DiscountHistoryItemDto {
   order_id: number;
+  pack_id: number | null;
   internal_sku: string | null;
   platform_sku: string | null;
   quantity: number;

@@ -1209,17 +1209,22 @@ export class OrderService {
     const { start, end } = this.getMLDateBoundaries(date);
 
     // MIN_APPROVED_DATE: solo retornar órdenes sin procesar desde la fecha de activación
-    // Comparación simple de strings YYYY-MM-DD para evitar problemas de timezone
+    const minApprovedDate = this.getMinApprovedDate();
     const minDateStr = (process.env.MIN_APPROVED_DATE || '').substring(0, 10);
     if (minDateStr && date < minDateStr) {
       return [];
     }
 
+    // Use the actual MIN_APPROVED_DATE timestamp, not just the date part
+    const effectiveStart = minApprovedDate && minApprovedDate > new Date(start)
+      ? minApprovedDate
+      : new Date(start);
+
     const orders = await this.orderRepository
       .createQueryBuilder('order')
       .leftJoinAndSelect('order.items', 'items')
       .where('order.sellerId = :sellerId', { sellerId })
-      .andWhere('order.date_approved >= :start', { start })
+      .andWhere('order.date_approved >= :start', { start: effectiveStart })
       .andWhere('order.date_approved <= :end', { end })
       // Excluir: Full, canceladas, y sin datos de logística (NULL = no se pudo obtener info)
       .andWhere('order.logistic_type IS NOT NULL')
@@ -1288,6 +1293,16 @@ export class OrderService {
         order_id: orderId,
         status: 'partial',
         message: 'Orden no encontrada',
+      };
+    }
+
+    // Check MIN_APPROVED_DATE - don't process orders before the tracking start date
+    const minApprovedDate = this.getMinApprovedDate();
+    if (minApprovedDate && order.date_approved < minApprovedDate) {
+      return {
+        order_id: orderId,
+        status: 'skipped',
+        message: `Orden anterior a MIN_APPROVED_DATE (${minApprovedDate.toISOString()})`,
       };
     }
 

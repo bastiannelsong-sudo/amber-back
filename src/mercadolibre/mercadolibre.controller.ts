@@ -297,9 +297,16 @@ export class MercadoLibreController {
       errors: [] as any[],
     };
 
+    // Helper to extract SKU from item attributes
+    const getSkuFromAttributes = (attributes: any[]): string | null => {
+      if (!attributes) return null;
+      const skuAttr = attributes.find((a: any) => a.id === 'SELLER_SKU');
+      return skuAttr?.value_name || null;
+    };
+
     for (const mlItem of mlItems) {
-      // Get SKU from seller_custom_field or variations
-      let sku = mlItem.seller_custom_field;
+      // Get SKU from seller_custom_field, SELLER_SKU attribute, or variations
+      let sku = mlItem.seller_custom_field || getSkuFromAttributes(mlItem.attributes);
       let variationId: number | null = null;
 
       // If no SKU at item level, check variations

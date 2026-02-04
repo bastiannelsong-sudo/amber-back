@@ -268,6 +268,179 @@ export class MercadoLibreController {
   }
 
   /**
+   * Discovery sync: Match ML items with local products by SKU and create links
+   * This updates product names, images, prices, and creates secondary_sku entries
+   */
+  @Post('products/discover')
+  async discoverAndLinkProducts(
+    @Query('seller_id', ParseIntPipe) sellerId: number,
+  ) {
+    // Get all local products
+    const localProducts = await this.productRepository.find();
+    const productsBySkuUpper = new Map(
+      localProducts.map((p) => [p.internal_sku.toUpperCase(), p]),
+    );
+
+    // Get all ML item IDs
+    const mlItemIds = await this.mercadoLibreService.getAllSellerItems(sellerId);
+
+    if (mlItemIds.length === 0) {
+      return { message: 'No hay items en Mercado Libre', matched: [], unmatched: [] };
+    }
+
+    // Get full details for all ML items
+    const mlItems = await this.mercadoLibreService.getMultipleItems(mlItemIds, sellerId);
+
+    const results = {
+      matched: [] as any[],
+      unmatched: [] as any[],
+      errors: [] as any[],
+    };
+
+    for (const mlItem of mlItems) {
+      // Get SKU from seller_custom_field or variations
+      let sku = mlItem.seller_custom_field;
+      let variationId: number | null = null;
+
+      // If no SKU at item level, check variations
+      if (!sku && mlItem.variations?.length > 0) {
+        // For items with variations, each variation has its own SKU
+        for (const variation of mlItem.variations) {
+          const varSku = variation.seller_custom_field;
+          if (varSku) {
+            const product = productsBySkuUpper.get(varSku.toUpperCase());
+            if (product) {
+              try {
+                // Check if link already exists
+                const existingLink = await this.secondarySkuRepository.findOne({
+                  where: {
+                    secondary_sku: mlItem.id,
+                    product: { product_id: product.product_id },
+                  },
+                });
+
+                if (!existingLink) {
+                  // Create secondary_sku link
+                  await this.secondarySkuRepository.save({
+                    secondary_sku: mlItem.id,
+                    stock_quantity: variation.available_quantity || 0,
+                    publication_link: mlItem.permalink,
+                    product: product,
+                    platform: { platform_id: 1 }, // Mercado Libre
+                  });
+                }
+
+                // Update product with ML data
+                const imageUrl = mlItem.pictures?.[0]?.url || null;
+                await this.productRepository.update(product.product_id, {
+                  name: mlItem.title,
+                  ...(imageUrl && { image_url: imageUrl }),
+                });
+
+                results.matched.push({
+                  ml_item_id: mlItem.id,
+                  ml_title: mlItem.title,
+                  internal_sku: product.internal_sku,
+                  variation_sku: varSku,
+                  price: mlItem.price,
+                  permalink: mlItem.permalink,
+                  image: imageUrl,
+                });
+              } catch (error) {
+                results.errors.push({
+                  ml_item_id: mlItem.id,
+                  sku: varSku,
+                  error: error.message,
+                });
+              }
+            }
+          }
+        }
+        continue; // Already processed variations
+      }
+
+      if (!sku) {
+        results.unmatched.push({
+          ml_item_id: mlItem.id,
+          ml_title: mlItem.title,
+          price: mlItem.price,
+          permalink: mlItem.permalink,
+          reason: 'Sin SKU en ML',
+        });
+        continue;
+      }
+
+      // Find matching local product
+      const product = productsBySkuUpper.get(sku.toUpperCase());
+
+      if (!product) {
+        results.unmatched.push({
+          ml_item_id: mlItem.id,
+          ml_title: mlItem.title,
+          ml_sku: sku,
+          price: mlItem.price,
+          permalink: mlItem.permalink,
+          reason: 'SKU no encontrado en productos locales',
+        });
+        continue;
+      }
+
+      try {
+        // Check if link already exists
+        const existingLink = await this.secondarySkuRepository.findOne({
+          where: {
+            secondary_sku: mlItem.id,
+            product: { product_id: product.product_id },
+          },
+        });
+
+        if (!existingLink) {
+          // Create secondary_sku link
+          await this.secondarySkuRepository.save({
+            secondary_sku: mlItem.id,
+            stock_quantity: mlItem.available_quantity || 0,
+            publication_link: mlItem.permalink,
+            product: product,
+            platform: { platform_id: 1 }, // Mercado Libre
+          });
+        }
+
+        // Update product with ML data
+        const imageUrl = mlItem.pictures?.[0]?.url || null;
+        await this.productRepository.update(product.product_id, {
+          name: mlItem.title,
+          ...(imageUrl && { image_url: imageUrl }),
+        });
+
+        results.matched.push({
+          ml_item_id: mlItem.id,
+          ml_title: mlItem.title,
+          internal_sku: product.internal_sku,
+          price: mlItem.price,
+          permalink: mlItem.permalink,
+          image: imageUrl,
+        });
+      } catch (error) {
+        results.errors.push({
+          ml_item_id: mlItem.id,
+          sku: sku,
+          error: error.message,
+        });
+      }
+    }
+
+    return {
+      summary: {
+        total_ml_items: mlItems.length,
+        matched: results.matched.length,
+        unmatched: results.unmatched.length,
+        errors: results.errors.length,
+      },
+      ...results,
+    };
+  }
+
+  /**
    * Sync images only: Update local product images from ML without changing stock
    */
   @Post('images/sync')

@@ -466,6 +466,8 @@ export class NotificationService {
     if (order.status === 'cancelled') {
       for (const { product, quantity: mappingQty } of mappedProducts) {
         const totalToRestore = quantity * mappingQty;
+        // Usar el internal_sku del producto si seller_sku está vacío
+        const auditSku = seller_sku || product.internal_sku;
         const metadata = {
           change_type: 'order' as const,
           changed_by: 'Sistema ML',
@@ -476,10 +478,10 @@ export class NotificationService {
         };
         try {
           await this.inventoryService.restoreStock(product.product_id, totalToRestore, metadata);
-          await this.createAudit(order, seller_sku, String(mlSku), 'CANCELLED', -totalToRestore);
+          await this.createAudit(order, auditSku, String(mlSku), 'CANCELLED', -totalToRestore);
         } catch (error) {
           this.logger.error(`Error restaurando stock producto ${product.product_id}, orden ${order.id}: ${error.message}`);
-          await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error restaurando stock: ${error.message}`);
+          await this.createAudit(order, auditSku, String(mlSku), 'NOT_FOUND', 0, `Error restaurando stock: ${error.message}`);
         }
       }
       return;
@@ -488,6 +490,8 @@ export class NotificationService {
     // Validar stock de TODOS los productos antes de descontar
     for (const { product, quantity: mappingQty } of mappedProducts) {
       const totalNeeded = quantity * mappingQty;
+      // Usar el internal_sku del producto si seller_sku está vacío
+      const auditSku = seller_sku || product.internal_sku;
       const hasStock = await this.inventoryService.validateStockAvailability(product.product_id, totalNeeded);
       if (!hasStock) {
         if (platformId) {
@@ -495,7 +499,7 @@ export class NotificationService {
             await this.pendingSalesService.create({
               platform_id: platformId,
               platform_order_id: String(order.id),
-              platform_sku: seller_sku || String(mlSku),
+              platform_sku: auditSku || String(mlSku),
               quantity: quantity,
               sale_date: order.date_approved,
               raw_data: { item, quantity, order_id: order.id, logistic_type: order.logistic_type },
@@ -504,7 +508,7 @@ export class NotificationService {
             this.logger.warn(`No se pudo crear PendingSale: ${error.message}`);
           }
         }
-        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Stock insuficiente en producto ${product.internal_sku} para descontar ${totalNeeded} unidades`);
+        await this.createAudit(order, auditSku, String(mlSku), 'NOT_FOUND', 0, `Stock insuficiente en producto ${product.internal_sku} para descontar ${totalNeeded} unidades`);
         return;
       }
     }
@@ -512,6 +516,8 @@ export class NotificationService {
     // Todo validado: descontar TODOS los productos
     for (const { product, quantity: mappingQty } of mappedProducts) {
       const totalToDeduct = quantity * mappingQty;
+      // Usar el internal_sku del producto si seller_sku está vacío
+      const auditSku = seller_sku || product.internal_sku;
       const metadata = {
         change_type: 'order' as const,
         changed_by: 'Sistema ML',
@@ -522,10 +528,10 @@ export class NotificationService {
       };
       try {
         await this.inventoryService.deductStock(product.product_id, totalToDeduct, metadata);
-        await this.createAudit(order, seller_sku, String(mlSku), 'OK_INTERNO', totalToDeduct);
+        await this.createAudit(order, auditSku, String(mlSku), 'OK_INTERNO', totalToDeduct);
       } catch (error) {
         this.logger.error(`Error descontando stock producto ${product.product_id}, orden ${order.id}: ${error.message}`);
-        await this.createAudit(order, seller_sku, String(mlSku), 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
+        await this.createAudit(order, auditSku, String(mlSku), 'NOT_FOUND', 0, `Error descontando stock: ${error.message}`);
       }
     }
   }

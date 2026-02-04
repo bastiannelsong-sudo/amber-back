@@ -813,7 +813,37 @@ export class MercadoLibreService {
           continue;
         }
 
-        const mlStock = mlItem.available_quantity || 0;
+        // Check if item has variations and find the specific one by SKU
+        let mlStock = mlItem.available_quantity || 0;
+        let variationInfo: { id: number; attributes: string } | null = null;
+
+        if (mlItem.variations && mlItem.variations.length > 0) {
+          // Try to find the variation that matches the internal SKU
+          const matchingVariation = mlItem.variations.find((v: any) =>
+            v.seller_custom_field === product.internal_sku ||
+            v.seller_custom_field?.toUpperCase() === product.internal_sku?.toUpperCase()
+          );
+
+          if (matchingVariation) {
+            // Use the specific variation's stock
+            mlStock = matchingVariation.available_quantity ?? mlStock;
+            variationInfo = {
+              id: matchingVariation.id,
+              attributes: matchingVariation.attribute_combinations
+                ?.map((attr: any) => `${attr.name}: ${attr.value_name}`)
+                .join(', ') || '',
+            };
+          } else if (mlItem.variations.length > 1) {
+            // Item has variations but we couldn't match by SKU
+            // This means the local SKU doesn't match any seller_custom_field
+            // Mark as having unmatched variations for user awareness
+            variationInfo = {
+              id: 0,
+              attributes: `⚠️ ${mlItem.variations.length} variaciones sin mapear por SKU`,
+            };
+          }
+        }
+
         const localStock = product.local_stock;
 
         const result = {
@@ -828,6 +858,7 @@ export class MercadoLibreService {
           ml_pictures: mlItem.pictures?.map((p: any) => p.url) || [],
           ml_price: mlItem.price,
           ml_permalink: mlItem.permalink,
+          ml_variation: variationInfo,
         };
 
         if (localStock === mlStock) {

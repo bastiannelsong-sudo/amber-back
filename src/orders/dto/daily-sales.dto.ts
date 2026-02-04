@@ -489,7 +489,7 @@ export class ReprocessItemResultDto {
 
 export class ReprocessResultDto {
   order_id: number;
-  status: 'processed' | 'partial' | 'already_processed';
+  status: 'processed' | 'partial' | 'already_processed' | 'skipped';
   message: string;
   items?: ReprocessItemResultDto[];
 }

@@ -367,15 +367,32 @@ export class NotificationService {
         }
 
         if (order.status === 'cancelled') {
-          const existingAudit = await this.productAuditRepository.findOne({
+          // Verificar si ya se procesó esta cancelación (evitar duplicados)
+          const existingCancelledAudit = await this.productAuditRepository.findOne({
             where: {
               order_id: order.id,
-              status: In(['OK_INTERNO'])
+              status: 'CANCELLED'
             }
           });
 
-          if (existingAudit) {
-            await this.handleInventoryAndAudit(order, itemDetail);
+          if (existingCancelledAudit) {
+            this.logger.log(`Cancelación ya procesada para orden ${order.id}, omitiendo...`);
+          } else {
+            // Verificar si existe una venta previa que necesita ser revertida
+            const existingOkAudit = await this.productAuditRepository.findOne({
+              where: {
+                order_id: order.id,
+                status: In(['OK_INTERNO'])
+              }
+            });
+
+            if (existingOkAudit) {
+              await this.handleInventoryAndAudit(order, itemDetail);
+            } else {
+              // Orden cancelada sin venta previa - solo registrar audit sin tocar inventario
+              this.logger.log(`Orden ${order.id} cancelada sin venta previa, solo registrando audit`);
+              await this.createAudit(order, seller_sku, String(itemId), 'CANCELLED', 0, 'Orden cancelada sin venta previa procesada');
+            }
           }
         }
         else{

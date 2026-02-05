@@ -648,6 +648,110 @@ export class MercadoLibreService {
   }
 
   /**
+   * Get item with include_attributes=all (may include SELLER_SKU in variations)
+   */
+  async getItemWithAttributes(itemId: string, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}?include_attributes=all`;
+      console.log(`[MercadoLibreService] Fetching item with attributes: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching item with attributes ${itemId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get a specific variation by ID (may include SELLER_SKU attribute)
+   */
+  async getVariationById(itemId: string, variationId: number, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}/variations/${variationId}`;
+      console.log(`[MercadoLibreService] Fetching variation: ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching variation ${variationId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get item variations with their SKUs (seller_custom_field)
+   * This endpoint returns full variation details including seller_custom_field
+   */
+  async getItemVariations(itemId: string, sellerId: number): Promise<any[]> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}/variations`;
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      const variations = response.data || [];
+      if (variations.length > 0) {
+        console.log(`[MercadoLibreService] Got ${variations.length} variations for ${normalizedId}`);
+        // Log first variation to see structure
+        const firstVar = variations[0];
+        console.log(`[MercadoLibreService] Sample variation SKU: seller_custom_field="${firstVar.seller_custom_field}", seller_sku="${firstVar.seller_sku}"`);
+      }
+
+      return variations;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error fetching variations for ${itemId}:`, error.message);
+      return [];
+    }
+  }
+
+  /**
    * Search seller's items by SKU (seller_sku attribute)
    */
   async searchItemsBySku(sku: string, sellerId: number): Promise<any> {
@@ -725,6 +829,49 @@ export class MercadoLibreService {
   }
 
   /**
+   * Update variation SKU (seller_custom_field) in Mercado Libre
+   */
+  async updateVariationSku(
+    itemId: string,
+    variationId: number,
+    sku: string,
+    sellerId: number,
+  ): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const normalizedId = this.normalizeItemId(itemId);
+      const url = `${this.apiUrl}/items/${normalizedId}/variations/${variationId}`;
+      console.log(`[MercadoLibreService] Updating variation SKU: ${normalizedId}/${variationId} -> "${sku}"`);
+
+      const response = await firstValueFrom(
+        this.httpService.put(
+          url,
+          { seller_custom_field: sku },
+          {
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+              'Content-Type': 'application/json',
+            },
+          }
+        )
+      );
+
+      console.log(`[MercadoLibreService] Variation SKU updated successfully`);
+      return response.data;
+    } catch (error) {
+      console.error(`[MercadoLibreService] Error updating variation SKU:`, error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Update item stock in Mercado Libre
    */
   async updateItemStock(itemId: string, quantity: number, sellerId: number): Promise<any> {
@@ -792,9 +939,58 @@ export class MercadoLibreService {
 
     try {
       // Fetch all ML items at once (IDs will be normalized inside getMultipleItems)
+      console.log(`[ValidateStock] Fetching ${itemIds.length} ML items...`);
       const mlItems = await this.getMultipleItems(itemIds, sellerId);
+      console.log(`[ValidateStock] Got ${mlItems.length} ML items`);
+
       // Map by full ML ID (with prefix)
       const mlItemsMap = new Map(mlItems.map(item => [item.id, item]));
+
+      // Identify items with variations that need individual variation fetching
+      // The /items/{id}/variations endpoint doesn't return SELLER_SKU attribute
+      // We need to fetch /items/{id}/variations/{variation_id} for each variation
+      const itemsWithVariations = mlItems.filter(item =>
+        item.variations && item.variations.length > 0
+      );
+
+      console.log(`[ValidateStock] ${itemsWithVariations.length} items have variations`);
+
+      // Collect all variation IDs to fetch individually
+      const variationFetchTasks: Array<{ itemId: string; variationId: number }> = [];
+      for (const item of itemsWithVariations) {
+        for (const variation of item.variations) {
+          variationFetchTasks.push({ itemId: item.id, variationId: variation.id });
+        }
+      }
+
+      console.log(`[ValidateStock] Fetching ${variationFetchTasks.length} individual variations for SELLER_SKU...`);
+
+      // Fetch individual variations in parallel with concurrency limit
+      // This is the only way to get SELLER_SKU attribute from ML API
+      const variationDetailsMap = new Map<number, any>();
+      const CONCURRENCY = 10;
+
+      for (let i = 0; i < variationFetchTasks.length; i += CONCURRENCY) {
+        const batch = variationFetchTasks.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.allSettled(
+          batch.map(task => this.getVariationById(task.itemId, task.variationId, sellerId))
+        );
+
+        batchResults.forEach((result, idx) => {
+          if (result.status === 'fulfilled' && result.value) {
+            variationDetailsMap.set(batch[idx].variationId, result.value);
+          }
+        });
+      }
+
+      console.log(`[ValidateStock] Fetched ${variationDetailsMap.size} variation details`);
+
+      // Helper to extract SELLER_SKU from variation's attributes array
+      const getSellerSkuFromVariation = (variation: any): string | null => {
+        if (!variation?.attributes) return null;
+        const skuAttr = variation.attributes.find((a: any) => a.id === 'SELLER_SKU');
+        return skuAttr?.value_name || null;
+      };
 
       for (const product of localProducts) {
         // Normalize the local ml_item_id to match the ML API response format
@@ -815,30 +1011,43 @@ export class MercadoLibreService {
 
         // Check if item has variations and find the specific one by SKU
         let mlStock = mlItem.available_quantity || 0;
-        let variationInfo: { id: number; attributes: string; unmatched_variations?: any[] } | null = null;
+        let variationInfo: { id: number; attributes: string; sku?: string; unmatched_variations?: any[] } | null = null;
 
         if (mlItem.variations && mlItem.variations.length > 0) {
+          // Build enriched variations with SELLER_SKU from individual fetches
+          const enrichedVariations = mlItem.variations.map((v: any) => {
+            const fullDetails = variationDetailsMap.get(v.id);
+            const sellerSku = fullDetails ? getSellerSkuFromVariation(fullDetails) : null;
+            return {
+              ...v,
+              seller_sku: sellerSku,
+              attributes: fullDetails?.attributes || [],
+            };
+          });
+
           // Try to find the variation that matches the internal SKU
-          const matchingVariation = mlItem.variations.find((v: any) =>
-            v.seller_custom_field === product.internal_sku ||
-            v.seller_custom_field?.toUpperCase() === product.internal_sku?.toUpperCase()
-          );
+          const matchingVariation = enrichedVariations.find((v: any) => {
+            const varSku = v.seller_sku || v.seller_custom_field;
+            return varSku === product.internal_sku ||
+              varSku?.toUpperCase() === product.internal_sku?.toUpperCase();
+          });
 
           if (matchingVariation) {
             // Use the specific variation's stock
             mlStock = matchingVariation.available_quantity ?? mlStock;
             variationInfo = {
               id: matchingVariation.id,
+              sku: matchingVariation.seller_sku,
               attributes: matchingVariation.attribute_combinations
                 ?.map((attr: any) => `${attr.name}: ${attr.value_name}`)
                 .join(', ') || '',
             };
-          } else if (mlItem.variations.length > 1) {
+          } else if (enrichedVariations.length > 1) {
             // Item has variations but we couldn't match by SKU
             // Build detailed list of available variations
-            const variationDetails = mlItem.variations.map((v: any) => ({
+            const variationDetails = enrichedVariations.map((v: any) => ({
               id: v.id,
-              sku: v.seller_custom_field || '(sin SKU)',
+              sku: v.seller_sku || '(sin SKU)',
               stock: v.available_quantity ?? 0,
               attributes: v.attribute_combinations
                 ?.map((attr: any) => `${attr.name}: ${attr.value_name}`)
@@ -847,7 +1056,7 @@ export class MercadoLibreService {
 
             variationInfo = {
               id: 0,
-              attributes: `⚠️ ${mlItem.variations.length} variaciones - Stock total: ${mlStock}`,
+              attributes: `⚠️ ${enrichedVariations.length} variaciones - Stock total: ${mlStock}`,
               unmatched_variations: variationDetails,
             };
           }

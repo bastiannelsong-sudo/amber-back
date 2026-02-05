@@ -22,8 +22,14 @@ export class Product {
   @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
   cost: number;
 
+  @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
+  price: number;
+
   @Column({ type: 'varchar', length: 500, nullable: true })
   image_url: string;
+
+  @Column({ type: 'simple-json', nullable: true })
+  images: string[];
 
   @OneToMany(
     () => SecondarySku,

@@ -86,6 +86,18 @@ export class NotificationService {
     return this.mlPlatformId;
   }
 
+  /**
+   * Parse a date string from MercadoLibre API, ensuring Chile timezone (-04:00) is applied.
+   * ML dates may come with or without timezone info. When missing, we assume -04:00.
+   * This prevents timezone misinterpretation when the server runs in UTC.
+   */
+  private parseMLDate(dateStr: string | null | undefined): Date {
+    if (!dateStr) return new Date();
+    const hasTimezone = /([+-]\d{2}:\d{2}|Z)$/.test(dateStr);
+    if (hasTimezone) return new Date(dateStr);
+    return new Date(`${dateStr}-04:00`);
+  }
+
   async saveNotification(data: Partial<Notification>): Promise<Notification> {
     const existingNotification = await this.notificationRepository.findOne({
       where: { id: data.id },
@@ -280,10 +292,10 @@ export class NotificationService {
     if (!order) {
       order = this.orderRepository.create({
         id: orderDetails.id,
-        date_approved : new Date(orderDetails.date_approved ?? orderDetails.date_created),
-        last_updated: new Date(orderDetails.last_updated),
-        expiration_date: orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null,
-        date_closed: orderDetails.date_closed ? new Date(orderDetails.date_closed) : null,
+        date_approved : this.parseMLDate(orderDetails.date_approved ?? orderDetails.date_created),
+        last_updated: this.parseMLDate(orderDetails.last_updated),
+        expiration_date: orderDetails.expiration_date ? this.parseMLDate(orderDetails.expiration_date) : null,
+        date_closed: orderDetails.date_closed ? this.parseMLDate(orderDetails.date_closed) : null,
         status: orderDetails.status,
         tags: orderDetails.tags,
         total_amount: orderDetails.total_amount,
@@ -306,10 +318,10 @@ export class NotificationService {
         }
       }
     } else {
-      order.date_approved = new Date(orderDetails.date_approved ?? orderDetails.date_created);
-      order.last_updated = new Date(orderDetails.last_updated);
-      order.expiration_date = orderDetails.expiration_date ? new Date(orderDetails.expiration_date) : null;
-      order.date_closed = orderDetails.date_closed ? new Date(orderDetails.date_closed) : null;
+      order.date_approved = this.parseMLDate(orderDetails.date_approved ?? orderDetails.date_created);
+      order.last_updated = this.parseMLDate(orderDetails.last_updated);
+      order.expiration_date = orderDetails.expiration_date ? this.parseMLDate(orderDetails.expiration_date) : null;
+      order.date_closed = orderDetails.date_closed ? this.parseMLDate(orderDetails.date_closed) : null;
       order.status = orderDetails.status;
       order.total_amount = orderDetails.total_amount;
       order.paid_amount = orderDetails.paid_amount;
@@ -588,7 +600,7 @@ export class NotificationService {
           marketplace_fee: finalMarketplaceFee,
           iva_amount: ivaAmount,
           total_paid_amount: paymentDetail.total_paid_amount,
-          date_approved: new Date(paymentDetail.date_approved),
+          date_approved: this.parseMLDate(paymentDetail.date_approved),
           currency_id: paymentDetail.currency_id,
         });
       } else {
@@ -600,7 +612,7 @@ export class NotificationService {
         payment.marketplace_fee = finalMarketplaceFee;
         payment.iva_amount = ivaAmount;
         payment.total_paid_amount = paymentDetail.total_paid_amount;
-        payment.date_approved = new Date(paymentDetail.date_approved);
+        payment.date_approved = this.parseMLDate(paymentDetail.date_approved);
         payment.currency_id = paymentDetail.currency_id;
       }
 

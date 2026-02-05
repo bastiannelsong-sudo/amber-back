@@ -95,6 +95,31 @@ export class OrderService {
   }
 
   /**
+   * Parse a date string from MercadoLibre API, ensuring Chile timezone (-04:00) is applied.
+   * ML dates may come with or without timezone info. When missing, we assume -04:00.
+   * This prevents timezone misinterpretation when the server runs in UTC.
+   *
+   * @param dateStr - Date string from MercadoLibre API
+   * @returns Date object with correct timezone interpretation
+   */
+  private parseMLDate(dateStr: string | null | undefined): Date {
+    if (!dateStr) return new Date();
+
+    // Check if the date string already has timezone info
+    // ISO formats: +HH:MM, -HH:MM, or Z
+    const hasTimezone = /([+-]\d{2}:\d{2}|Z)$/.test(dateStr);
+
+    if (hasTimezone) {
+      // Date already has timezone, parse directly
+      return new Date(dateStr);
+    }
+
+    // No timezone - assume Chile time (-04:00)
+    // ML internally uses -04:00 for Chile regardless of DST
+    return new Date(`${dateStr}-04:00`);
+  }
+
+  /**
    * Get start and end boundaries for a MercadoLibre/SII date using fixed -04:00 timezone.
    *
    * MercadoLibre always uses -04:00 for Chile internally (regardless of DST).
@@ -1216,9 +1241,12 @@ export class OrderService {
     }
 
     // Use the actual MIN_APPROVED_DATE timestamp, not just the date part
-    const effectiveStart = minApprovedDate && minApprovedDate > new Date(start)
+    // Format to string to avoid TypeORM timezone conversion issues
+    const startDate = new Date(start);
+    const effectiveStartDate = minApprovedDate && minApprovedDate > startDate
       ? minApprovedDate
-      : new Date(start);
+      : startDate;
+    const effectiveStart = this.formatLocalTimestamp(effectiveStartDate);
 
     const orders = await this.orderRepository
       .createQueryBuilder('order')
@@ -1774,12 +1802,12 @@ export class OrderService {
     // Save order - use column names directly for relations (TypeORM upsert doesn't handle relation objects)
     const orderData: any = {
       id: mlOrder.id,
-      date_approved: new Date(mlOrder.date_created || mlOrder.date_closed),
-      last_updated: new Date(mlOrder.last_updated || new Date()),
+      date_approved: this.parseMLDate(mlOrder.date_created || mlOrder.date_closed),
+      last_updated: this.parseMLDate(mlOrder.last_updated),
       expiration_date: mlOrder.expiration_date
-        ? new Date(mlOrder.expiration_date)
+        ? this.parseMLDate(mlOrder.expiration_date)
         : null,
-      date_closed: mlOrder.date_closed ? new Date(mlOrder.date_closed) : null,
+      date_closed: mlOrder.date_closed ? this.parseMLDate(mlOrder.date_closed) : null,
       status: mlOrder.status,
       total_amount: mlOrder.total_amount || 0,
       paid_amount: mlOrder.paid_amount || 0,
@@ -1948,7 +1976,7 @@ export class OrderService {
             fazt_is_special_zone: faztIsSpecialZone, // Si es zona especial
             total_paid_amount: payment.total_paid_amount || 0,
             date_approved: payment.date_approved
-              ? new Date(payment.date_approved)
+              ? this.parseMLDate(payment.date_approved)
               : new Date(),
             currency_id: payment.currency_id || 'CLP',
           },
@@ -2246,7 +2274,7 @@ export class OrderService {
         ps.resolved_by,
         ps.resolved_at::text AS resolved_at,
         ps.platform_sku,
-        (COALESCE(o.date_approved, pa.created_at) AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santiago')::text AS sale_date,
+        COALESCE(o.date_approved, pa.created_at)::text AS sale_date,
         pa.platform_name
       FROM product_audits pa
       LEFT JOIN "order" o ON o.id = pa.order_id

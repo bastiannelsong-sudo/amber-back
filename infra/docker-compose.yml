@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  # Base de datos PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: amber-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-amber}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-amber_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-amber} -d ${DB_NAME:-amber_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - amber-network
+
+  # Backend NestJS
+  backend:
+    build:
+      context: ./amber-back
+      dockerfile: Dockerfile
+    container_name: amber-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: America/Santiago
+      NODE_ENV: production
+      PORT: 3000
+      DB_TYPE: postgres
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USERNAME: ${DB_USER:-amber}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE: ${DB_NAME:-amber_db}
+      CLIENT_ID: ${ML_CLIENT_ID}
+      CLIENT_SECRET: ${ML_CLIENT_SECRET}
+      REDIRECT_URI: ${ML_REDIRECT_URI}
+      MERCADO_LIBRE_AUTH_URL: https://auth.mercadolibre.cl/authorization
+      MERCADO_LIBRE_TOKEN_URL: https://api.mercadolibre.com/oauth/token
+      MERCADO_LIBRE_API_URL: https://api.mercadolibre.com
+      IVA_PERCENTAGE: ${IVA_PERCENTAGE:-19}
+      FRONTEND_URL: ${FRONTEND_URL:-https://amber.ambernelson.cl}
+      MIN_APPROVED_DATE: ${MIN_APPROVED_DATE}
+    networks:
+      - amber-network
+
+  # Frontend React (Vite)
+  frontend:
+    build:
+      context: ./amber-front
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+    container_name: amber-frontend
+    restart: unless-stopped
+    environment:
+      TZ: America/Santiago
+    depends_on:
+      - backend
+    networks:
+      - amber-network
+
+  # Nginx Reverse Proxy con SSL
+  nginx:
+    image: nginx:alpine
+    container_name: amber-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - amber-network
+
+  # Certbot para SSL (Let's Encrypt)
+  certbot:
+    image: certbot/certbot
+    container_name: amber-certbot
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+networks:
+  amber-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

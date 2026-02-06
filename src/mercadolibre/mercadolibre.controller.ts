@@ -137,7 +137,8 @@ export class MercadoLibreController {
       });
 
       if (lastSnapshot) {
-        console.log(`[StockValidation] 📦 Loading from cache (last updated: ${lastSnapshot.created_at})`);
+        const cacheTimestamp = lastSnapshot.created_at ? lastSnapshot.created_at.toISOString() : new Date().toISOString();
+        console.log(`[StockValidation] 📦 Loading from cache (last updated: ${cacheTimestamp})`);
         return {
           summary: {
             total: lastSnapshot.total_items,
@@ -148,7 +149,7 @@ export class MercadoLibreController {
           ...lastSnapshot.results_data,
           metadata: {
             from_cache: true,
-            last_updated: lastSnapshot.created_at,
+            last_updated: cacheTimestamp,
             execution_time_ms: lastSnapshot.execution_time_ms,
           },
         };
@@ -245,8 +246,9 @@ export class MercadoLibreController {
     });
 
     const savedSnapshot = await this.snapshotRepository.save(snapshot);
+    const timestamp = savedSnapshot.created_at ? savedSnapshot.created_at.toISOString() : new Date().toISOString();
     console.log(`[StockValidation] ✅ Saved snapshot_id: ${savedSnapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
-    console.log(`[StockValidation] 🕐 Sending timestamp: ${savedSnapshot.created_at} (type: ${typeof savedSnapshot.created_at})`);
+    console.log(`[StockValidation] 🕐 Sending timestamp: ${timestamp}`);
 
     return {
       summary: {
@@ -260,7 +262,7 @@ export class MercadoLibreController {
       errors: enrichedErrors,
       metadata: {
         from_cache: false,
-        last_updated: savedSnapshot.created_at || new Date(),
+        last_updated: timestamp,
         execution_time_ms: executionTime,
       },
     };

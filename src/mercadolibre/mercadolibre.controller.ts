@@ -137,7 +137,9 @@ export class MercadoLibreController {
       });
 
       if (lastSnapshot) {
-        const cacheTimestamp = lastSnapshot.created_at ? lastSnapshot.created_at.toISOString() : new Date().toISOString();
+        // Use stored ISO timestamp to avoid timezone conversion issues
+        const cacheTimestamp = lastSnapshot.results_data?._timestamp_iso ||
+          (lastSnapshot.created_at ? lastSnapshot.created_at.toISOString() : new Date().toISOString());
         console.log(`[StockValidation] 📦 Loading from cache (last updated: ${cacheTimestamp})`);
         return {
           summary: {
@@ -231,6 +233,7 @@ export class MercadoLibreController {
     const executionTime = Date.now() - startTime;
 
     // Save snapshot to database
+    const currentTimestamp = new Date().toISOString();
     const snapshot = this.snapshotRepository.create({
       seller_id: sellerId,
       total_items: localProducts.length,
@@ -241,13 +244,14 @@ export class MercadoLibreController {
         matching: enrichedMatching,
         discrepancies: enrichedDiscrepancies,
         errors: enrichedErrors,
+        // Store ISO timestamp in results_data to avoid timezone issues
+        _timestamp_iso: currentTimestamp,
       },
       execution_time_ms: executionTime,
     });
 
     const savedSnapshot = await this.snapshotRepository.save(snapshot);
-    // Use current time instead of snapshot.created_at to avoid timezone conversion issues
-    const timestamp = new Date().toISOString();
+    const timestamp = currentTimestamp;
     console.log(`[StockValidation] ✅ Saved snapshot_id: ${savedSnapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
     console.log(`[StockValidation] 🕐 Sending timestamp: ${timestamp}`);
 

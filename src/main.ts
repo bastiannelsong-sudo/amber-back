@@ -28,7 +28,8 @@ async function bootstrap() {
 
   // Habilitar CORS con credenciales
   const allowedOrigins = [
-    'http://localhost:5173',
+    'http://localhost:5173',  // Vite frontend
+    'http://localhost:3001',  // Next.js ecommerce
     process.env.FRONTEND_URL,
   ].filter(Boolean);
 

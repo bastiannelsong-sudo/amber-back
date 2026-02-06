@@ -2236,8 +2236,9 @@ export class OrderService {
     toDate: string,
     sellerId: number,
   ): Promise<DiscountHistoryResponseDto> {
-    const rangeStart = this.getMLDateBoundaries(fromDate).start;
-    const rangeEnd = this.getMLDateBoundaries(toDate).end;
+    // Use simple date strings for filtering (no timezone boundaries)
+    const rangeStart = fromDate;
+    const rangeEnd = toDate;
 
     const rows: Array<{
       audit_id: number;
@@ -2256,6 +2257,7 @@ export class OrderService {
       resolved_at: string | null;
       platform_sku: string | null;
       sale_date: string | null;
+      sale_date_only: string | null;
       platform_name: string | null;
     }> = await this.dataSource.query(
       `SELECT
@@ -2275,26 +2277,27 @@ export class OrderService {
         ps.resolved_at::text AS resolved_at,
         ps.platform_sku,
         COALESCE(o.date_approved, pa.created_at)::text AS sale_date,
+        DATE(COALESCE(o.date_approved, pa.created_at))::text AS sale_date_only,
         pa.platform_name
       FROM product_audits pa
       LEFT JOIN "order" o ON o.id = pa.order_id
       LEFT JOIN pending_sales ps
         ON ps.platform_order_id = pa.order_id::text
         AND ps.platform_sku = pa.secondary_sku
-      WHERE pa.created_at >= $2
-        AND pa.created_at <= $3
+      WHERE DATE(COALESCE(o.date_approved, pa.created_at)) >= $2::date
+        AND DATE(COALESCE(o.date_approved, pa.created_at)) <= $3::date
         AND (o."sellerId" = $1 OR pa.platform_name = 'Falabella')
         AND ($4::timestamp IS NULL OR COALESCE(o.date_approved, pa.created_at) >= $4::timestamp)
         AND (pa.logistic_type IS NULL OR pa.logistic_type != 'fulfillment')
         AND pa.status != 'OK_FULL'
-      ORDER BY pa.created_at DESC`,
+      ORDER BY COALESCE(o.date_approved, pa.created_at) DESC`,
       [sellerId, rangeStart, rangeEnd, this.getMinApprovedDate()],
     );
 
-    // Group by day
+    // Group by sale date (instead of audit date)
     const dayMap = new Map<string, typeof rows>();
     for (const row of rows) {
-      const date = row.audit_date;
+      const date = row.sale_date_only || row.audit_date;
       if (!dayMap.has(date)) dayMap.set(date, []);
       dayMap.get(date)!.push(row);
     }

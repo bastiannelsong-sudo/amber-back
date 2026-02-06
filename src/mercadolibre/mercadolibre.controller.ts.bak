@@ -4,7 +4,6 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Product } from '../products/entities/product.entity';
 import { SecondarySku } from '../products/entities/secondary-sku.entity';
-import { StockValidationSnapshot } from './entities/stock-validation-snapshot.entity';
 
 @Controller('mercadolibre')
 export class MercadoLibreController {
@@ -14,8 +13,6 @@ export class MercadoLibreController {
     private readonly productRepository: Repository<Product>,
     @InjectRepository(SecondarySku)
     private readonly secondarySkuRepository: Repository<SecondarySku>,
-    @InjectRepository(StockValidationSnapshot)
-    private readonly snapshotRepository: Repository<StockValidationSnapshot>,
   ) {}
 
   @Get('orders')
@@ -120,44 +117,16 @@ export class MercadoLibreController {
   /**
    * Validate stock: Compare local inventory with ML stock
    * Returns discrepancies between local and ML stock
-   * Supports caching: returns cached results unless force_refresh=true
+   * Supports pagination with page and limit parameters
    */
   @Get('stock/validate')
   async validateStock(
     @Query('seller_id', ParseIntPipe) sellerId: number,
-    @Query('force_refresh') forceRefresh?: string,
+    @Query('page') pageStr?: string,
+    @Query('limit') limitStr?: string,
   ) {
-    const shouldRefresh = forceRefresh === 'true';
-
-    // If NOT force_refresh, try to return cached snapshot
-    if (!shouldRefresh) {
-      const lastSnapshot = await this.snapshotRepository.findOne({
-        where: { seller_id: sellerId },
-        order: { created_at: 'DESC' },
-      });
-
-      if (lastSnapshot) {
-        console.log(`[StockValidation] 📦 Loading from cache (last updated: ${lastSnapshot.created_at})`);
-        return {
-          summary: {
-            total: lastSnapshot.total_items,
-            matching: lastSnapshot.matching_count,
-            discrepancies: lastSnapshot.discrepancy_count,
-            errors: lastSnapshot.error_count,
-          },
-          ...lastSnapshot.results_data,
-          metadata: {
-            from_cache: true,
-            last_updated: lastSnapshot.created_at,
-            execution_time_ms: lastSnapshot.execution_time_ms,
-          },
-        };
-      }
-    }
-
-    // Execute fresh validation
-    console.log(`[StockValidation] 🔄 Executing fresh validation for seller ${sellerId}`);
-    const startTime = Date.now();
+    const page = pageStr ? parseInt(pageStr, 10) : 1;
+    const limit = limitStr ? parseInt(limitStr, 10) : 50;
 
     // Get all products with ML secondary SKUs (platform_id = 1 for Mercado Libre)
     const secondarySkus = await this.secondarySkuRepository.find({
@@ -177,10 +146,11 @@ export class MercadoLibreController {
         matching: [],
         discrepancies: [],
         errors: [],
-        metadata: {
-          from_cache: false,
-          last_updated: new Date(),
-          execution_time_ms: 0,
+        pagination: {
+          page: 1,
+          limit,
+          total: 0,
+          totalPages: 0,
         },
       };
     }
@@ -196,352 +166,56 @@ export class MercadoLibreController {
         ? (sku.product.stock || 0)
         : (sku.product.stock || 0) + (sku.product.stock_bodega || 0),
       ml_item_id: sku.secondary_sku, // Este es el MLC... de ML
-      logistic_type: sku.logistic_type, // Pass logistic_type to service
     }));
 
     const result = await this.mercadoLibreService.validateStockWithML(localProducts, sellerId);
 
-    // Create a map of ml_item_id -> logistic_type for easy lookup
-    const logisticTypeMap = new Map(
-      secondarySkus.map(sku => [sku.secondary_sku, sku.logistic_type])
+    // Calculate pagination for the combined results (discrepancies + matching + errors)
+    const allItems = [...result.discrepancies, ...result.matching, ...result.errors];
+    const totalItems = allItems.length;
+    const totalPages = Math.ceil(totalItems / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+
+    // Paginate each array separately but maintain the same slice range
+    const paginatedDiscrepancies = result.discrepancies.slice(
+      Math.max(0, startIndex),
+      Math.min(result.discrepancies.length, endIndex)
     );
 
-    // Enrich results with logistic_type and stock details
-    const enrichItem = (item: any) => ({
-      ...item,
-      logistic_type: logisticTypeMap.get(item.ml_item_id) || 'other',
-      stock: secondarySkus.find(s => s.secondary_sku === item.ml_item_id)?.product.stock || 0,
-      stock_bodega: secondarySkus.find(s => s.secondary_sku === item.ml_item_id)?.product.stock_bodega || 0,
-      // Preserve stock breakdown fields
-      ml_stock_flex: item.ml_stock_flex,
-      ml_stock_full: item.ml_stock_full,
-    });
+    const remainingStart = Math.max(0, startIndex - result.discrepancies.length);
+    const remainingEnd = Math.max(0, endIndex - result.discrepancies.length);
 
-    const enrichedMatching = result.matching.map(enrichItem);
-    const enrichedDiscrepancies = result.discrepancies.map(enrichItem);
-    const enrichedErrors = result.errors;
-
-    // Log how many items have stock breakdown
-    const itemsWithBreakdown = [...enrichedMatching, ...enrichedDiscrepancies].filter(
-      item => item.ml_stock_flex != null || item.ml_stock_full != null
+    const paginatedMatching = result.matching.slice(
+      remainingStart,
+      Math.min(result.matching.length, remainingEnd)
     );
-    console.log(`[Controller] 📤 Sending ${itemsWithBreakdown.length} items with stock breakdown to frontend`);
 
-    const executionTime = Date.now() - startTime;
+    const finalStart = Math.max(0, remainingStart - result.matching.length);
+    const finalEnd = Math.max(0, remainingEnd - result.matching.length);
 
-    // Save snapshot to database
-    const snapshot = this.snapshotRepository.create({
-      seller_id: sellerId,
-      total_items: localProducts.length,
-      matching_count: enrichedMatching.length,
-      discrepancy_count: enrichedDiscrepancies.length,
-      error_count: enrichedErrors.length,
-      results_data: {
-        matching: enrichedMatching,
-        discrepancies: enrichedDiscrepancies,
-        errors: enrichedErrors,
-      },
-      execution_time_ms: executionTime,
-    });
-
-    await this.snapshotRepository.save(snapshot);
-    console.log(`[StockValidation] ✅ Saved snapshot_id: ${snapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
+    const paginatedErrors = result.errors.slice(
+      finalStart,
+      Math.min(result.errors.length, finalEnd)
+    );
 
     return {
       summary: {
         total: localProducts.length,
-        matching: enrichedMatching.length,
-        discrepancies: enrichedDiscrepancies.length,
-        errors: enrichedErrors.length,
+        matching: result.matching.length,
+        discrepancies: result.discrepancies.length,
+        errors: result.errors.length,
       },
-      matching: enrichedMatching,
-      discrepancies: enrichedDiscrepancies,
-      errors: enrichedErrors,
-      metadata: {
-        from_cache: false,
-        last_updated: snapshot.created_at,
-        execution_time_ms: executionTime,
-      },
-    };
-  }
-
-  /**
-   * Diagnose why a product doesn't appear in stock validation
-   */
-  @Get('stock/diagnose/:sku')
-  async diagnoseProduct(
-    @Param('sku') sku: string,
-    @Query('seller_id', ParseIntPipe) sellerId: number,
-  ) {
-    console.log(`[Diagnose] 🔍 Investigating SKU: ${sku}`);
-
-    // 1. Find product in database
-    const product = await this.productRepository.findOne({
-      where: { internal_sku: sku },
-    });
-
-    if (!product) {
-      return {
-        found: false,
-        error: `Product with SKU ${sku} not found in database`,
-        suggestion: 'Verify the SKU is correct',
-      };
-    }
-
-    // 2. Find secondary SKU for Mercado Libre
-    const secondarySku = await this.secondarySkuRepository.findOne({
-      where: {
-        product: { product_id: product.product_id },
-        platform: { platform_id: 1 }, // Mercado Libre
-      },
-      relations: ['product', 'platform'],
-    });
-
-    if (!secondarySku) {
-      return {
-        found: true,
-        product: {
-          internal_sku: product.internal_sku,
-          name: product.name,
-          stock: product.stock,
-          stock_bodega: product.stock_bodega,
-        },
-        linked_to_ml: false,
-        error: 'Product not linked to Mercado Libre',
-        suggestion: 'Add a secondary SKU for Mercado Libre (platform_id = 1)',
-      };
-    }
-
-    // 3. Try to fetch from Mercado Libre
-    let mlItemData: any = null;
-    let mlError: string | null = null;
-
-    try {
-      mlItemData = await this.mercadoLibreService.getItem(
-        secondarySku.secondary_sku,
-        sellerId,
-      );
-    } catch (error: any) {
-      mlError = error.message || 'Failed to fetch from ML';
-    }
-
-    // 4. Check if it's in latest snapshot
-    const latestSnapshot = await this.snapshotRepository.findOne({
-      where: { seller_id: sellerId },
-      order: { created_at: 'DESC' },
-    });
-
-    let inSnapshot: 'matching' | 'discrepancies' | 'errors' | 'not_found' = 'not_found';
-    if (latestSnapshot) {
-      const allItems = [
-        ...latestSnapshot.results_data.matching,
-        ...latestSnapshot.results_data.discrepancies,
-        ...latestSnapshot.results_data.errors,
-      ];
-      const foundItem = allItems.find(
-        (item: any) => item.internal_sku === sku || item.ml_item_id === secondarySku.secondary_sku
-      );
-
-      if (foundItem) {
-        if (latestSnapshot.results_data.matching.some((i: any) => i.internal_sku === sku)) {
-          inSnapshot = 'matching';
-        } else if (latestSnapshot.results_data.discrepancies.some((i: any) => i.internal_sku === sku)) {
-          inSnapshot = 'discrepancies';
-        } else if (latestSnapshot.results_data.errors.some((i: any) => i.internal_sku === sku)) {
-          inSnapshot = 'errors';
-        }
-      }
-    }
-
-    // 5. Build diagnosis
-    const diagnosis: any = {
-      found: true,
-      linked_to_ml: true,
-      product: {
-        internal_sku: product.internal_sku,
-        name: product.name,
-        stock: product.stock,
-        stock_bodega: product.stock_bodega,
-        stock_total: product.stock + (product.stock_bodega || 0),
-      },
-      ml_link: {
-        secondary_sku: secondarySku.secondary_sku,
-        ml_item_id: `MLC-${secondarySku.secondary_sku}`,
-        publication_link: secondarySku.publication_link,
-        logistic_type: secondarySku.logistic_type,
-        variation_id: secondarySku.variation_id,
-      },
-      ml_status: mlItemData ? {
-        exists: true,
-        status: mlItemData.status,
-        available_quantity: mlItemData.available_quantity,
-        sold_quantity: mlItemData.sold_quantity,
-        has_variations: mlItemData.variations?.length > 0,
-        variations_count: mlItemData.variations?.length || 0,
-      } : {
-        exists: false,
-        error: mlError,
-      },
-      validation_snapshot: {
-        exists: !!latestSnapshot,
-        last_validation: latestSnapshot?.created_at,
-        in_results: inSnapshot,
+      matching: paginatedMatching,
+      discrepancies: paginatedDiscrepancies,
+      errors: paginatedErrors,
+      pagination: {
+        page,
+        limit,
+        total: totalItems,
+        totalPages,
       },
     };
-
-    // 6. Add possible reasons if not found in results
-    if (inSnapshot === 'not_found' && latestSnapshot) {
-      diagnosis.possible_reasons = [];
-
-      if (mlItemData?.status === 'paused' || mlItemData?.status === 'closed') {
-        diagnosis.possible_reasons.push({
-          reason: 'Item is PAUSED or CLOSED in Mercado Libre',
-          detail: `Status: ${mlItemData.status}. Paused items are skipped during validation.`,
-          solution: 'Activate the item in Mercado Libre',
-        });
-      }
-
-      if (!mlItemData?.variations || mlItemData.variations.length === 0) {
-        const hasUserProductId = mlItemData?.user_product_id || mlItemData?.catalog_product_id;
-        if (!hasUserProductId) {
-          diagnosis.possible_reasons.push({
-            reason: 'No user_product_id and no variations in ML',
-            detail: 'Cannot fetch stock breakdown without user_product_id or variations from ML API',
-            solution: 'Check if item has variations in ML or if ML provides user_product_id',
-          });
-        }
-      }
-
-      if (mlItemData?.variations?.length > 0) {
-        const variationsWithUserProductId = mlItemData.variations.filter(
-          (v: any) => v.user_product_id
-        );
-        if (variationsWithUserProductId.length === 0) {
-          diagnosis.possible_reasons.push({
-            reason: 'Variations exist but none have user_product_id',
-            detail: `Found ${mlItemData.variations.length} variations, but none have user_product_id`,
-            solution: 'ML API issue or variations not properly configured',
-          });
-        }
-      }
-
-      if (mlError) {
-        diagnosis.possible_reasons.push({
-          reason: 'Error fetching from Mercado Libre API',
-          detail: mlError,
-          solution: 'Check ML API credentials and item permissions',
-        });
-      }
-    }
-
-    return diagnosis;
-  }
-
-  /**
-   * Test ML Search API - Diagnose why sync doesn't find a product
-   * Tests the actual ML search that the sync uses
-   */
-  @Get('stock/test-search/:sku')
-  async testMLSearch(
-    @Param('sku') sku: string,
-    @Query('seller_id', ParseIntPipe) sellerId: number,
-  ) {
-    console.log(`[Test Search] 🔍 Testing ML search for SKU: ${sku}`);
-
-    const result: any = {
-      sku,
-      seller_id: sellerId,
-      search_result: null,
-      items_found: [],
-      variations_with_seller_sku: [],
-      diagnosis: {
-        search_works: false,
-        items_count: 0,
-        has_matching_variation: false,
-        reason: null,
-      },
-    };
-
-    try {
-      // Step 1: Test the search
-      console.log(`[Test Search] Step 1: Calling searchItemsBySku("${sku}", ${sellerId})`);
-      const searchResult = await this.mercadoLibreService.searchItemsBySku(sku, sellerId);
-      result.search_result = searchResult;
-
-      if (!searchResult || !searchResult.results || searchResult.results.length === 0) {
-        result.diagnosis.search_works = false;
-        result.diagnosis.reason = `La búsqueda ML /users/${sellerId}/items/search?seller_sku=${sku} no devolvió resultados. ` +
-          `Esto significa que el SELLER_SKU no está configurado en el item o sus variaciones en Mercado Libre.`;
-        console.log(`[Test Search] ❌ No results found`);
-        return result;
-      }
-
-      result.diagnosis.search_works = true;
-      result.diagnosis.items_count = searchResult.results.length;
-      result.items_found = searchResult.results;
-
-      console.log(`[Test Search] ✅ Found ${searchResult.results.length} items`);
-
-      // Step 2: For each item, get full details and check variations
-      for (const itemId of searchResult.results) {
-        console.log(`[Test Search] Step 2: Fetching item details for ${itemId}`);
-
-        try {
-          const itemData = await this.mercadoLibreService.getItem(itemId, sellerId);
-
-          if (itemData.variations && itemData.variations.length > 0) {
-            console.log(`[Test Search] Item ${itemId} has ${itemData.variations.length} variations, checking each...`);
-
-            // Fetch each variation's details to get SELLER_SKU
-            for (const variation of itemData.variations) {
-              try {
-                const varDetails = await this.mercadoLibreService.getVariationById(
-                  itemId,
-                  variation.id,
-                  sellerId,
-                );
-
-                const sellerSku = varDetails?.attributes?.find((a: any) => a.id === 'SELLER_SKU')?.value_name;
-
-                result.variations_with_seller_sku.push({
-                  item_id: itemId,
-                  variation_id: variation.id,
-                  seller_sku: sellerSku || null,
-                  matches: sellerSku?.toUpperCase() === sku.toUpperCase(),
-                  stock: variation.available_quantity,
-                });
-
-                if (sellerSku?.toUpperCase() === sku.toUpperCase()) {
-                  result.diagnosis.has_matching_variation = true;
-                  console.log(`[Test Search] ✅ Variation ${variation.id} has SELLER_SKU = "${sellerSku}" (MATCH)`);
-                }
-              } catch (error) {
-                console.log(`[Test Search] ⚠️  Error fetching variation ${variation.id}:`, error.message);
-              }
-            }
-          } else {
-            console.log(`[Test Search] Item ${itemId} has no variations`);
-          }
-        } catch (error) {
-          console.log(`[Test Search] ⚠️  Error fetching item ${itemId}:`, error.message);
-        }
-      }
-
-      // Diagnosis summary
-      if (result.diagnosis.has_matching_variation) {
-        result.diagnosis.reason = `✅ TODO CORRECTO: La búsqueda encuentra el item y tiene variación con SELLER_SKU="${sku}". ` +
-          `El sync DEBERÍA vincular correctamente. Si no lo hace, revisa los logs del sync.`;
-      } else {
-        result.diagnosis.reason = `⚠️  PROBLEMA: La búsqueda encuentra items pero ninguna variación tiene SELLER_SKU="${sku}". ` +
-          `Necesitas configurar el SELLER_SKU en ML para que el sync pueda hacer el match.`;
-      }
-
-    } catch (error) {
-      result.diagnosis.reason = `❌ ERROR: ${error.message}`;
-      console.error(`[Test Search] Error:`, error.message);
-    }
-
-    return result;
   }
 
   /**
@@ -1095,32 +769,13 @@ export class MercadoLibreController {
           product.internal_sku,
           sellerId,
         );
-
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 1: Búsqueda en ML`);
-          console.log(`   SKU buscado: "${product.internal_sku}"`);
-          console.log(`   Resultado de búsqueda:`, searchResult);
-          console.log(`   Items encontrados: ${searchResult?.results?.length || 0}`);
-          if (searchResult?.results?.length > 0) {
-            console.log(`   IDs: ${searchResult.results.join(', ')}`);
-          } else {
-            console.log(`   ❌ NO ENCONTRADO - La búsqueda ML no devolvió items`);
-            console.log(`   Posible causa: SELLER_SKU no configurado en ML`);
-          }
-          console.log(`${'='.repeat(70)}\n`);
-        }
-
         return { product, itemIds: searchResult?.results || [] };
       },
       CONCURRENCY,
     );
 
     // Collect all item IDs and map to products
-    // FIXED: Changed to Map<string, Product[]> to support multiple products per item
-    // (e.g., PCR0007, PCR0008, PCR0009 all map to the same ML item)
-    const itemToProductMap = new Map<string, Product[]>();
+    const itemToProductMap = new Map<string, Product>();
     const allItemIds: string[] = [];
 
     for (const { item: product, result, error } of skuSearchResults) {
@@ -1133,11 +788,7 @@ export class MercadoLibreController {
         continue;
       }
       for (const itemId of result.itemIds) {
-        // Add product to array instead of overwriting
-        const existingProducts = itemToProductMap.get(itemId) || [];
-        existingProducts.push(product);
-        itemToProductMap.set(itemId, existingProducts);
-
+        itemToProductMap.set(itemId, product);
         if (!allItemIds.includes(itemId)) {
           allItemIds.push(itemId);
         }
@@ -1213,24 +864,19 @@ export class MercadoLibreController {
     const processedProducts = new Set<number>();
 
     for (const mlItem of mlItems) {
-      const products = itemToProductMap.get(mlItem.id);
-      if (!products || products.length === 0) continue;
+      const product = itemToProductMap.get(mlItem.id);
+      if (!product) continue;
 
       // Skip paused, closed, or inactive items - only sync active ones
       if (mlItem.status !== 'active') {
-        for (const product of products) {
-          results.discovery.skipped_paused.push({
-            internal_sku: product.internal_sku,
-            ml_item_id: mlItem.id,
-            ml_title: mlItem.title,
-            status: mlItem.status,
-          });
-        }
+        results.discovery.skipped_paused.push({
+          internal_sku: product.internal_sku,
+          ml_item_id: mlItem.id,
+          ml_title: mlItem.title,
+          status: mlItem.status,
+        });
         continue;
       }
-
-      // FIXED: Process each product that maps to this item
-      for (const product of products) {
 
       const logisticType = mlItem.shipping?.logistic_type || 'other';
 
@@ -1240,56 +886,18 @@ export class MercadoLibreController {
       let matchedVariation: any = null;
 
       if (mlItem.variations && mlItem.variations.length > 0) {
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 3: Procesando Item ${mlItem.id}`);
-          console.log(`   Título ML: "${mlItem.title}"`);
-          console.log(`   Status: ${mlItem.status}`);
-          console.log(`   Logistic Type: ${logisticType}`);
-          console.log(`   Variaciones totales: ${mlItem.variations.length}`);
-          console.log(`${'='.repeat(70)}`);
-        }
-
         // Find the variation that matches this product's SKU
         for (const variation of mlItem.variations) {
           const fullDetails = variationDetailsMap.get(variation.id);
           const varSku = fullDetails ? getSellerSkuFromVariation(fullDetails) : null;
-
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n   📦 Variación ${variation.id}:`);
-            console.log(`      - Detalles obtenidos: ${fullDetails ? '✅ Sí' : '❌ No'}`);
-            console.log(`      - SELLER_SKU: ${varSku ? `"${varSku}"` : '❌ NULL'}`);
-            console.log(`      - Match con "PCR0008": ${varSku?.toUpperCase() === 'PCR0008' ? '✅ SÍ' : '❌ NO'}`);
-            console.log(`      - Stock: ${variation.available_quantity ?? 0}`);
-          }
 
           if (varSku && varSku.toUpperCase() === product.internal_sku.toUpperCase()) {
             matchedVariationId = variation.id;
             matchedVariation = variation;
             stockToUse = variation.available_quantity ?? 0;
             console.log(`[Full Sync] Matched variation ${variation.id} (${varSku}) to product ${product.internal_sku}`);
-
-            // 🔍 LOG DETALLADO para PCR0008
-            if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-              console.log(`\n   ✅ MATCH ENCONTRADO!`);
-              console.log(`      - Variation ID seleccionada: ${matchedVariationId}`);
-              console.log(`      - Stock a usar: ${stockToUse}`);
-            }
-
             break;
           }
-        }
-
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          if (!matchedVariationId) {
-            console.log(`\n   ❌ NO SE ENCONTRÓ MATCH`);
-            console.log(`   Ninguna variación tiene SELLER_SKU = "PCR0008"`);
-            console.log(`   El secondary_sku NO se creará para este producto.`);
-          }
-          console.log(`${'='.repeat(70)}\n`);
         }
       }
 
@@ -1321,25 +929,6 @@ export class MercadoLibreController {
             logisticType,
             variationId: matchedVariationId,
           });
-
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n${'='.repeat(70)}`);
-            console.log(`🔍 [PCR0008] Step 4: Actualizando link existente`);
-            console.log(`   Secondary SKU ID: ${existingLink.secondary_sku_id}`);
-            console.log(`   Logistic Type: ${logisticType}`);
-            console.log(`   Variation ID: ${matchedVariationId}`);
-            console.log(`${'='.repeat(70)}\n`);
-          }
-        } else {
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n${'='.repeat(70)}`);
-            console.log(`🔍 [PCR0008] Step 4: Link ya existe y está actualizado`);
-            console.log(`   Secondary SKU ID: ${existingLink.secondary_sku_id}`);
-            console.log(`   No requiere cambios`);
-            console.log(`${'='.repeat(70)}\n`);
-          }
         }
       } else {
         linksToCreate.push({
@@ -1351,19 +940,6 @@ export class MercadoLibreController {
           product: { product_id: product.product_id },
           platform: { platform_id: 1 },
         });
-
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 4: Creando nuevo link`);
-          console.log(`   ML Item ID: ${mlItem.id}`);
-          console.log(`   Variation ID: ${matchedVariationId || 'NULL'}`);
-          console.log(`   Product ID: ${product.product_id}`);
-          console.log(`   Logistic Type: ${logisticType}`);
-          console.log(`   Stock: ${stockToUse}`);
-          console.log(`   ✅ Se agregará a la cola de creación`);
-          console.log(`${'='.repeat(70)}\n`);
-        }
       }
 
       // Queue product update (only once per product)
@@ -1409,8 +985,7 @@ export class MercadoLibreController {
         images_count: allImages.length,
         is_new_link: !existingLink,
       });
-      } // End of: for (const product of products)
-    } // End of: for (const mlItem of mlItems)
+    }
 
     // Execute batch DB operations
     if (linksToCreate.length > 0) {

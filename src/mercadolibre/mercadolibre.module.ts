@@ -7,12 +7,13 @@ import { Session } from '../auth/entities/session.entity';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Product } from '../products/entities/product.entity';
 import { SecondarySku } from '../products/entities/secondary-sku.entity';
+import { StockValidationSnapshot } from './entities/stock-validation-snapshot.entity';
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
   controllers: [MercadoLibreController],
   imports: [
-    TypeOrmModule.forFeature([Session, Product, SecondarySku]),
+    TypeOrmModule.forFeature([Session, Product, SecondarySku, StockValidationSnapshot]),
     AuthModule,
     ConfigModule,
     HttpModule,

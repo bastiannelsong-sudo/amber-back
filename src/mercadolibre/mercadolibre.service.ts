@@ -648,6 +648,84 @@ export class MercadoLibreService {
   }
 
   /**
+   * Search items by SELLER_SKU to get the correct user_product_id
+   * This helps us get the right ID for querying stock by location
+   */
+  async searchItemBySKU(sku: string, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const url = `${this.apiUrl}/users/${sellerId}/items/search?seller_sku=${encodeURIComponent(sku)}`;
+      console.log(`[SearchBySKU] Searching for SKU: ${sku}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      if (response.data && response.data.results && response.data.results.length > 0) {
+        console.log(`[SearchBySKU] ✓ Found ${response.data.results.length} items for SKU ${sku}`);
+        return response.data.results[0]; // Return first match
+      }
+
+      console.log(`[SearchBySKU] ✗ No items found for SKU ${sku}`);
+      return null;
+    } catch (error) {
+      const status = error.response?.status;
+      const message = error.response?.data?.message || error.message;
+      console.log(`[SearchBySKU] ✗ Error ${status} searching SKU ${sku}: ${message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get stock breakdown by location (Full/Flex coexistence)
+   * Returns stock in meli_facility (Full) and selling_address (Flex)
+   * Only works for items with logistic_type=fulfillment and tag self_service_in
+   * Available in Argentina (MLA) and Chile (MLC)
+   */
+  async getStockByLocation(userProductId: string, sellerId: number): Promise<any> {
+    try {
+      const session = await this.sessionRepository.findOne({
+        where: { user_id: sellerId },
+      });
+
+      if (!session) {
+        throw new Error('No se encontró sesión activa');
+      }
+
+      const url = `${this.apiUrl}/user-products/${userProductId}/stock`;
+      console.log(`[StockByLocation] GET ${url}`);
+
+      const response = await firstValueFrom(
+        this.httpService.get(url, {
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+          },
+        })
+      );
+
+      console.log(`[StockByLocation] ✓ Response for ${userProductId}:`, JSON.stringify(response.data));
+      return response.data;
+    } catch (error) {
+      // Not all items support this endpoint (only Full/Flex coexistence)
+      const status = error.response?.status;
+      const message = error.response?.data?.message || error.message;
+      console.log(`[StockByLocation] ✗ Error ${status} for ${userProductId}: ${message}`);
+      throw error; // Re-throw para que el caller pueda manejarlo
+    }
+  }
+
+  /**
    * Get item with include_attributes=all (may include SELLER_SKU in variations)
    */
   async getItemWithAttributes(itemId: string, sellerId: number): Promise<any> {
@@ -919,6 +997,7 @@ export class MercadoLibreService {
       name: string;
       local_stock: number;
       ml_item_id: string;
+      logistic_type?: string;
     }>,
     sellerId: number
   ): Promise<{
@@ -946,6 +1025,91 @@ export class MercadoLibreService {
       // Map by full ML ID (with prefix)
       const mlItemsMap = new Map(mlItems.map(item => [item.id, item]));
 
+      // Fetch stock breakdown (Full/Flex) using VARIATION user_product_ids
+      // With rate limiting to avoid 429 errors
+      console.log(`[ValidateStock] ⚡ Fetching stock breakdown (optimized with parallelization)...`);
+      const stockBreakdownStartTime = Date.now();
+      const stockByLocationMap = new Map<string, any>(); // Map by item ID (for items without variations)
+      const stockByVariationMap = new Map<number, any>(); // Map by variation ID (for items with variations)
+
+      // Helper function to delay execution
+      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+      // Process items in batches with rate limiting
+      const BATCH_SIZE = 10; // Process 10 items at a time
+      const DELAY_BETWEEN_CALLS = 100; // 100ms between calls (optimized from 150ms)
+
+      let processedCount = 0;
+
+      for (let i = 0; i < mlItems.length; i += BATCH_SIZE) {
+        const batch = mlItems.slice(i, i + BATCH_SIZE);
+        console.log(`[ValidateStock] Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(mlItems.length / BATCH_SIZE)}`);
+
+        for (const mlItem of batch) {
+          // Check if item has variations with user_product_id
+          if (mlItem.variations && mlItem.variations.length > 0) {
+            const variationsWithUserProductId = mlItem.variations.filter(v => v.user_product_id);
+
+            if (variationsWithUserProductId.length > 0) {
+              // Store stock breakdown PER VARIATION - PARALLEL with staggering to avoid rate limits
+              const stockPromises = variationsWithUserProductId.map(async (variation, idx) => {
+                try {
+                  // Stagger calls to avoid rate limiting (50ms between each)
+                  await delay(idx * 50);
+
+                  const stockData = await this.getStockByLocation(variation.user_product_id, sellerId);
+
+                  if (stockData && stockData.locations) {
+                    const flexLocation = stockData.locations.find((loc: any) => loc.type === 'selling_address');
+                    const fullLocation = stockData.locations.find((loc: any) => loc.type === 'meli_facility');
+
+                    // Store by variation ID, not item ID
+                    stockByVariationMap.set(variation.id, {
+                      locations: [
+                        { type: 'selling_address', quantity: flexLocation?.quantity || 0 },
+                        { type: 'meli_facility', quantity: fullLocation?.quantity || 0 }
+                      ]
+                    });
+                  }
+                } catch (error) {
+                  if (error.response?.status === 429) {
+                    console.log(`[ValidateStock] ⚠️ Rate limit on variation ${variation.id}, waiting 3s...`);
+                    await delay(3000);
+                  }
+                }
+              });
+
+              // Wait for all variations in parallel
+              await Promise.allSettled(stockPromises);
+            }
+          } else {
+            const userProductId = mlItem.user_product_id || mlItem.catalog_product_id;
+
+            if (userProductId) {
+              try {
+                const stockData = await this.getStockByLocation(userProductId, sellerId);
+                if (stockData && stockData.locations) {
+                  stockByLocationMap.set(mlItem.id, stockData);
+                }
+                await delay(DELAY_BETWEEN_CALLS);
+              } catch (error) {
+                if (error.response?.status === 429) {
+                  await delay(3000);
+                }
+              }
+            }
+          }
+
+          processedCount++;
+          if (processedCount % 20 === 0) {
+            console.log(`[ValidateStock] Progress: ${processedCount}/${mlItems.length} items, ${stockByLocationMap.size} with stock data`);
+          }
+        }
+      }
+
+      const stockBreakdownTime = ((Date.now() - stockBreakdownStartTime) / 1000).toFixed(1);
+      console.log(`[ValidateStock] ✅ Stock breakdown complete in ${stockBreakdownTime}s: ${stockByLocationMap.size} items + ${stockByVariationMap.size} variations`);
+
       // Identify items with variations that need individual variation fetching
       // The /items/{id}/variations endpoint doesn't return SELLER_SKU attribute
       // We need to fetch /items/{id}/variations/{variation_id} for each variation
@@ -963,12 +1127,13 @@ export class MercadoLibreService {
         }
       }
 
-      console.log(`[ValidateStock] Fetching ${variationFetchTasks.length} individual variations for SELLER_SKU...`);
+      console.log(`[ValidateStock] ⚡ Fetching ${variationFetchTasks.length} individual variations for SELLER_SKU (concurrency: 20)...`);
+      const variationFetchStartTime = Date.now();
 
       // Fetch individual variations in parallel with concurrency limit
       // This is the only way to get SELLER_SKU attribute from ML API
       const variationDetailsMap = new Map<number, any>();
-      const CONCURRENCY = 10;
+      const CONCURRENCY = 20; // Increased from 10 for better performance
 
       for (let i = 0; i < variationFetchTasks.length; i += CONCURRENCY) {
         const batch = variationFetchTasks.slice(i, i + CONCURRENCY);
@@ -983,7 +1148,8 @@ export class MercadoLibreService {
         });
       }
 
-      console.log(`[ValidateStock] Fetched ${variationDetailsMap.size} variation details`);
+      const variationFetchTime = ((Date.now() - variationFetchStartTime) / 1000).toFixed(1);
+      console.log(`[ValidateStock] ✅ Fetched ${variationDetailsMap.size} variation details in ${variationFetchTime}s`);
 
       // Helper to extract SELLER_SKU from variation's attributes array
       const getSellerSkuFromVariation = (variation: any): string | null => {
@@ -1025,12 +1191,39 @@ export class MercadoLibreService {
             };
           });
 
+          // 🔍 LOG para PCR0007/PCR0008/PCR0009
+          if (['PCR0007', 'PCR0008', 'PCR0009'].includes(product.internal_sku)) {
+            console.log(`\n${'='.repeat(70)}`);
+            console.log(`🔍 [${product.internal_sku}] Buscando match en validación de stock`);
+            console.log(`   Item ML: ${mlItem.id}`);
+            console.log(`   Variaciones totales: ${enrichedVariations.length}`);
+            enrichedVariations.forEach((v: any) => {
+              console.log(`\n   📦 Variación ${v.id}:`);
+              console.log(`      - SELLER_SKU: ${v.seller_sku ? `"${v.seller_sku}"` : '❌ NULL'}`);
+              console.log(`      - available_quantity: ${v.available_quantity ?? 0}`);
+              console.log(`      - Match: ${v.seller_sku?.toUpperCase() === product.internal_sku.toUpperCase() ? '✅' : '❌'}`);
+            });
+          }
+
           // Try to find the variation that matches the internal SKU
           const matchingVariation = enrichedVariations.find((v: any) => {
             const varSku = v.seller_sku || v.seller_custom_field;
             return varSku === product.internal_sku ||
               varSku?.toUpperCase() === product.internal_sku?.toUpperCase();
           });
+
+          // 🔍 LOG resultado del match para PCR0007/PCR0008/PCR0009
+          if (['PCR0007', 'PCR0008', 'PCR0009'].includes(product.internal_sku)) {
+            if (matchingVariation) {
+              console.log(`\n   ✅ MATCH ENCONTRADO:`);
+              console.log(`      - Variation ID: ${matchingVariation.id}`);
+              console.log(`      - Stock a usar: ${matchingVariation.available_quantity ?? mlStock}`);
+            } else {
+              console.log(`\n   ❌ NO SE ENCONTRÓ MATCH`);
+              console.log(`      - Se usará stock total del item: ${mlStock}`);
+            }
+            console.log(`${'='.repeat(70)}\n`);
+          }
 
           if (matchingVariation) {
             // Use the specific variation's stock
@@ -1064,6 +1257,41 @@ export class MercadoLibreService {
 
         const localStock = product.local_stock;
 
+        // Get stock breakdown if available (Full/Flex)
+        // For items with variations, use the matched variation's stock breakdown
+        // For items without variations, use the item-level stock breakdown
+        let stockBreakdown = null;
+        if (variationInfo && variationInfo.id > 0) {
+          // Has matched variation - use variation-specific stock
+          stockBreakdown = stockByVariationMap.get(variationInfo.id);
+        } else {
+          // No variation or no match - use item-level stock
+          stockBreakdown = stockByLocationMap.get(normalizedId);
+        }
+
+        let mlStockFull: number | null = null;
+        let mlStockFlex: number | null = null;
+
+        if (stockBreakdown?.locations) {
+          const fullLocation = stockBreakdown.locations.find((loc: any) => loc.type === 'meli_facility');
+          const flexLocation = stockBreakdown.locations.find((loc: any) => loc.type === 'selling_address');
+
+          mlStockFull = fullLocation?.quantity ?? null;
+          mlStockFlex = flexLocation?.quantity ?? null;
+
+          // For variations with stock breakdown, calculate total stock based on logistic_type
+          if (variationInfo && variationInfo.id > 0 && mlStockFlex != null) {
+            if (product.logistic_type === 'fulfillment') {
+              // For fulfillment: only compare with Flex (your depot)
+              // Full stock is managed by ML, not your responsibility
+              mlStock = mlStockFlex;
+            } else if (mlStockFull != null) {
+              // For cross_docking/flex: compare with total (Flex + Full)
+              mlStock = mlStockFlex + mlStockFull;
+            }
+          }
+        }
+
         const result = {
           product_id: product.product_id,
           internal_sku: product.internal_sku,
@@ -1072,12 +1300,31 @@ export class MercadoLibreService {
           ml_title: mlItem.title,
           local_stock: localStock,
           ml_stock: mlStock,
+          ml_stock_full: mlStockFull,
+          ml_stock_flex: mlStockFlex,
           ml_status: mlItem.status,
           ml_pictures: mlItem.pictures?.map((p: any) => p.url) || [],
           ml_price: mlItem.price,
           ml_permalink: mlItem.permalink,
           ml_variation: variationInfo,
         };
+
+        // 🔍 LOG para PCR0007/PCR0008/PCR0009 - Ver valores finales
+        if (['PCR0007', 'PCR0008', 'PCR0009'].includes(product.internal_sku)) {
+          console.log(`\n${'='.repeat(70)}`);
+          console.log(`🔍 [${product.internal_sku}] VALORES FINALES:`);
+          console.log(`   local_stock: ${localStock}`);
+          console.log(`   ml_stock (available_quantity): ${mlStock}`);
+          console.log(`   ml_stock_flex (selling_address): ${mlStockFlex}`);
+          console.log(`   ml_stock_full (meli_facility): ${mlStockFull}`);
+          console.log(`   difference: ${localStock - mlStock}`);
+          console.log(`   stockBreakdown exists: ${stockBreakdown ? 'YES' : 'NO'}`);
+          if (stockBreakdown?.locations) {
+            console.log(`   stockBreakdown.locations:`, JSON.stringify(stockBreakdown.locations, null, 2));
+          }
+          console.log(`   Categoría: ${localStock === mlStock ? 'MATCHING ✅' : 'DISCREPANCY ❌'}`);
+          console.log(`${'='.repeat(70)}\n`);
+        }
 
         if (localStock === mlStock) {
           matching.push(result);
@@ -1091,6 +1338,19 @@ export class MercadoLibreService {
     } catch (error) {
       console.error(`[MercadoLibreService] Error validating stock:`, error.message);
       errors.push({ error: error.message });
+    }
+
+    // Log summary of stock breakdown data
+    const itemsWithStockBreakdown = [...matching, ...discrepancies].filter(
+      item => item.ml_stock_flex != null || item.ml_stock_full != null
+    );
+    console.log(`[ValidateStock] 📊 Final result: ${itemsWithStockBreakdown.length} items with stock breakdown data`);
+    if (itemsWithStockBreakdown.length > 0) {
+      console.log(`[ValidateStock] Sample:`, {
+        sku: itemsWithStockBreakdown[0].internal_sku,
+        flex: itemsWithStockBreakdown[0].ml_stock_flex,
+        full: itemsWithStockBreakdown[0].ml_stock_full,
+      });
     }
 
     return { matching, discrepancies, errors };

@@ -48,7 +48,6 @@ export class MercadoLibreService {
       }
 
       const accessToken = session.access_token;
-      console.log('Intentando acceder con el token:', accessToken);
 
       // ML API internally uses -04:00 for Chile regardless of DST.
       // During Chilean summer (-03:00), orders between 00:00-00:59 Chilean time
@@ -264,7 +263,7 @@ export class MercadoLibreService {
 
   private async refreshAccessToken(refreshToken: string): Promise<any> {
     try {
-      console.log('Realizando solicitud para refrescar el token...' + refreshToken);
+      console.log('Realizando solicitud para refrescar el token...');
       const response = await firstValueFrom(
         this.httpService.post(
           `${this.apiUrl}/oauth/token`,
@@ -309,7 +308,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Order details payments:`, JSON.stringify(response.data?.payments, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error fetching order details ${orderId}:`, error.message);
@@ -342,7 +340,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Billing info response:`, JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error fetching billing info for order ${orderId}:`, error.message);
@@ -408,7 +405,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Shipment costs response:`, JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error fetching shipment costs ${shipmentId}:`, error.message);
@@ -441,7 +437,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Shipment by ID response:`, JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error fetching shipment ${shipmentId}:`, error.message);
@@ -531,7 +526,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Pack info response:`, JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error fetching pack ${packId}:`, error.message);
@@ -714,7 +708,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[StockByLocation] ✓ Response for ${userProductId}:`, JSON.stringify(response.data));
       return response.data;
     } catch (error) {
       // Not all items support this endpoint (only Full/Flex coexistence)
@@ -1309,23 +1302,6 @@ export class MercadoLibreService {
           ml_variation: variationInfo,
         };
 
-        // 🔍 LOG para PCR0007/PCR0008/PCR0009 - Ver valores finales
-        if (['PCR0007', 'PCR0008', 'PCR0009'].includes(product.internal_sku)) {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [${product.internal_sku}] VALORES FINALES:`);
-          console.log(`   local_stock: ${localStock}`);
-          console.log(`   ml_stock (available_quantity): ${mlStock}`);
-          console.log(`   ml_stock_flex (selling_address): ${mlStockFlex}`);
-          console.log(`   ml_stock_full (meli_facility): ${mlStockFull}`);
-          console.log(`   difference: ${localStock - mlStock}`);
-          console.log(`   stockBreakdown exists: ${stockBreakdown ? 'YES' : 'NO'}`);
-          if (stockBreakdown?.locations) {
-            console.log(`   stockBreakdown.locations:`, JSON.stringify(stockBreakdown.locations, null, 2));
-          }
-          console.log(`   Categoría: ${localStock === mlStock ? 'MATCHING ✅' : 'DISCREPANCY ❌'}`);
-          console.log(`${'='.repeat(70)}\n`);
-        }
-
         if (localStock === mlStock) {
           matching.push(result);
         } else {
@@ -1383,7 +1359,6 @@ export class MercadoLibreService {
         })
       );
 
-      console.log(`[MercadoLibreService] Orders by pack_id response:`, JSON.stringify(response.data, null, 2));
       return response.data;
     } catch (error) {
       console.error(`[MercadoLibreService] Error searching orders by pack ${packId}:`, error.message);

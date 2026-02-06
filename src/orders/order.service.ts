@@ -42,6 +42,7 @@ import { InventoryService, MappedProduct } from '../products/services/inventory.
 import { PendingSalesService } from '../notification/services/pending-sales.service';
 import { Product } from '../products/entities/product.entity';
 import { Platform } from '../products/entities/platform.entity';
+import { parseMLDate } from '../common/utils/date.utils';
 
 /**
  * Order Service
@@ -94,30 +95,6 @@ export class OrderService {
     return `${y}-${m}-${day} ${h}:${min}:${s}.${ms}`;
   }
 
-  /**
-   * Parse a date string from MercadoLibre API, ensuring Chile timezone (-04:00) is applied.
-   * ML dates may come with or without timezone info. When missing, we assume -04:00.
-   * This prevents timezone misinterpretation when the server runs in UTC.
-   *
-   * @param dateStr - Date string from MercadoLibre API
-   * @returns Date object with correct timezone interpretation
-   */
-  private parseMLDate(dateStr: string | null | undefined): Date {
-    if (!dateStr) return new Date();
-
-    // Check if the date string already has timezone info
-    // ISO formats: +HH:MM, -HH:MM, or Z
-    const hasTimezone = /([+-]\d{2}:\d{2}|Z)$/.test(dateStr);
-
-    if (hasTimezone) {
-      // Date already has timezone, parse directly
-      return new Date(dateStr);
-    }
-
-    // No timezone - assume Chile time (-04:00)
-    // ML internally uses -04:00 for Chile regardless of DST
-    return new Date(`${dateStr}-04:00`);
-  }
 
   /**
    * Get start and end boundaries for a MercadoLibre/SII date using fixed -04:00 timezone.
@@ -1802,12 +1779,12 @@ export class OrderService {
     // Save order - use column names directly for relations (TypeORM upsert doesn't handle relation objects)
     const orderData: any = {
       id: mlOrder.id,
-      date_approved: this.parseMLDate(mlOrder.date_created || mlOrder.date_closed),
-      last_updated: this.parseMLDate(mlOrder.last_updated),
+      date_approved: parseMLDate(mlOrder.date_created || mlOrder.date_closed),
+      last_updated: parseMLDate(mlOrder.last_updated),
       expiration_date: mlOrder.expiration_date
-        ? this.parseMLDate(mlOrder.expiration_date)
+        ? parseMLDate(mlOrder.expiration_date)
         : null,
-      date_closed: mlOrder.date_closed ? this.parseMLDate(mlOrder.date_closed) : null,
+      date_closed: mlOrder.date_closed ? parseMLDate(mlOrder.date_closed) : null,
       status: mlOrder.status,
       total_amount: mlOrder.total_amount || 0,
       paid_amount: mlOrder.paid_amount || 0,
@@ -1976,7 +1953,7 @@ export class OrderService {
             fazt_is_special_zone: faztIsSpecialZone, // Si es zona especial
             total_paid_amount: payment.total_paid_amount || 0,
             date_approved: payment.date_approved
-              ? this.parseMLDate(payment.date_approved)
+              ? parseMLDate(payment.date_approved)
               : new Date(),
             currency_id: payment.currency_id || 'CLP',
           },

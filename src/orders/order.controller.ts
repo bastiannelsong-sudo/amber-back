@@ -1,6 +1,7 @@
 import {
   Controller,
   Get,
+  Post,
   Query,
   UsePipes,
   ValidationPipe,
@@ -166,7 +167,7 @@ export class OrderController {
    * Fetches orders from ML API and saves them to the database
    * Applies: security-validate-all-input (using ValidationPipe + DTO)
    */
-  @Get('sync')
+  @Post('sync')
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async syncOrders(
     @Query() query: SyncOrdersQueryDto,
@@ -234,7 +235,7 @@ export class OrderController {
    *
    * Only works if the order has NO existing audits (prevents double-deduction).
    */
-  @Get('reprocess-order')
+  @Post('reprocess-order')
   async reprocessOrder(
     @Query('order_id') orderIdStr: string,
     @Query('seller_id') sellerIdStr: string,
@@ -255,7 +256,7 @@ export class OrderController {
    *
    * Processes all orders without audits (excluding fulfillment/cancelled).
    */
-  @Get('reprocess-all')
+  @Post('reprocess-all')
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async reprocessAllOrders(
     @Query() query: SyncOrdersQueryDto,
@@ -278,7 +279,7 @@ export class OrderController {
    * Fetches all orders for each day in the month and saves them (PARALLEL - 5 days at a time)
    * Also recalculates Fazt costs for all Flex orders
    */
-  @Get('sync-month')
+  @Post('sync-month')
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async syncMonthlyOrders(
     @Query() query: SyncMonthlyOrdersQueryDto,
@@ -301,7 +302,7 @@ export class OrderController {
    * Syncs multiple days in parallel (5 at a time) for faster performance
    * Maximum range is 31 days
    */
-  @Get('sync-range')
+  @Post('sync-range')
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async syncDateRange(
     @Query('from_date') fromDate: string,
@@ -347,7 +348,7 @@ export class OrderController {
    *
    * Useful to run after the regular sync to catch status changes
    */
-  @Get('sync-status-changes')
+  @Post('sync-status-changes')
   async syncStatusChanges(
     @Query('from_date') fromDate: string,
     @Query('to_date') toDate: string,
@@ -384,19 +385,23 @@ export class OrderController {
       throw new BadRequestException('Se requiere order_id y seller_id');
     }
 
-    // Fetch all available data from ML APIs
-    const orderDetails = await this.mercadoLibreService.getOrderDetails(orderIdNum, sellerIdNum);
-    const orderShipment = await this.mercadoLibreService.getOrderShipment(orderIdNum, sellerIdNum);
-    const billingInfo = await this.mercadoLibreService.getOrderBillingInfo(orderIdNum, sellerIdNum);
+    // Fetch all available data from ML APIs in parallel
+    const [orderDetails, orderShipment, billingInfo] = await Promise.all([
+      this.mercadoLibreService.getOrderDetails(orderIdNum, sellerIdNum),
+      this.mercadoLibreService.getOrderShipment(orderIdNum, sellerIdNum),
+      this.mercadoLibreService.getOrderBillingInfo(orderIdNum, sellerIdNum),
+    ]);
 
-    // If we have a shipment_id, fetch shipment details and costs
+    // If we have a shipment_id, fetch shipment details and costs in parallel
     let shipmentDetails = null;
     let shipmentCosts = null;
     const shipmentId = orderDetails?.shipping?.id || orderShipment?.id;
 
     if (shipmentId) {
-      shipmentDetails = await this.mercadoLibreService.getShipmentById(shipmentId, sellerIdNum);
-      shipmentCosts = await this.mercadoLibreService.getShipmentCosts(shipmentId, sellerIdNum);
+      [shipmentDetails, shipmentCosts] = await Promise.all([
+        this.mercadoLibreService.getShipmentById(shipmentId, sellerIdNum),
+        this.mercadoLibreService.getShipmentCosts(shipmentId, sellerIdNum),
+      ]);
     }
 
     return {
@@ -430,14 +435,12 @@ export class OrderController {
       throw new BadRequestException('Se requiere pack_id y seller_id');
     }
 
-    // Try to get pack info directly
-    const packInfo = await this.mercadoLibreService.getPackInfo(packIdNum, sellerIdNum);
-
-    // Also search for orders with this pack_id
-    const ordersByPack = await this.mercadoLibreService.getOrdersByPackId(packIdNum, sellerIdNum);
-
-    // Check if we have this order in our local database
-    const localOrders = await this.orderService.findByPackId(packIdNum, sellerIdNum);
+    // Fetch pack info, orders by pack, and local orders in parallel
+    const [packInfo, ordersByPack, localOrders] = await Promise.all([
+      this.mercadoLibreService.getPackInfo(packIdNum, sellerIdNum),
+      this.mercadoLibreService.getOrdersByPackId(packIdNum, sellerIdNum),
+      this.orderService.findByPackId(packIdNum, sellerIdNum),
+    ]);
 
     return {
       pack_id: packIdNum,

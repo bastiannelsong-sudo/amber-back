@@ -17,11 +17,13 @@ import { Product } from '../products/entities/product.entity';
 import { InventoryService, MappedProduct } from '../products/services/inventory.service';
 import { PendingSalesService } from './services/pending-sales.service';
 import { Platform } from '../products/entities/platform.entity';
+import { parseMLDate } from '../common/utils/date.utils';
 
 
 @Injectable()
 export class NotificationService {
   private readonly logger = new Logger(NotificationService.name);
+
   private readonly clientId: string;
   private readonly clientSecret: string;
   private readonly apiUrl: string;
@@ -86,17 +88,6 @@ export class NotificationService {
     return this.mlPlatformId;
   }
 
-  /**
-   * Parse a date string from MercadoLibre API, ensuring Chile timezone (-04:00) is applied.
-   * ML dates may come with or without timezone info. When missing, we assume -04:00.
-   * This prevents timezone misinterpretation when the server runs in UTC.
-   */
-  private parseMLDate(dateStr: string | null | undefined): Date {
-    if (!dateStr) return new Date();
-    const hasTimezone = /([+-]\d{2}:\d{2}|Z)$/.test(dateStr);
-    if (hasTimezone) return new Date(dateStr);
-    return new Date(`${dateStr}-04:00`);
-  }
 
   async saveNotification(data: Partial<Notification>): Promise<Notification> {
     const existingNotification = await this.notificationRepository.findOne({
@@ -241,13 +232,19 @@ export class NotificationService {
   }
 
   private async processOrder(orderDetails: any): Promise<void> {
-    await this.saveBuyer(orderDetails.buyer);
-    await this.saveSeller(orderDetails.seller);
+    // Save buyer and seller in parallel (independent)
+    await Promise.all([
+      this.saveBuyer(orderDetails.buyer),
+      this.saveSeller(orderDetails.seller),
+    ]);
 
     const order = await this.saveOrder(orderDetails);
 
-    await this.saveOrderItems(orderDetails.order_items, order);
-    await this.savePayments(orderDetails.payments, order);
+    // Save items and payments in parallel (both depend only on order)
+    await Promise.all([
+      this.saveOrderItems(orderDetails.order_items, order),
+      this.savePayments(orderDetails.payments, order),
+    ]);
   }
 
   private async saveBuyer(buyerDetails: any): Promise<void> {
@@ -292,10 +289,10 @@ export class NotificationService {
     if (!order) {
       order = this.orderRepository.create({
         id: orderDetails.id,
-        date_approved : this.parseMLDate(orderDetails.date_approved ?? orderDetails.date_created),
-        last_updated: this.parseMLDate(orderDetails.last_updated),
-        expiration_date: orderDetails.expiration_date ? this.parseMLDate(orderDetails.expiration_date) : null,
-        date_closed: orderDetails.date_closed ? this.parseMLDate(orderDetails.date_closed) : null,
+        date_approved : parseMLDate(orderDetails.date_approved ?? orderDetails.date_created),
+        last_updated: parseMLDate(orderDetails.last_updated),
+        expiration_date: orderDetails.expiration_date ? parseMLDate(orderDetails.expiration_date) : null,
+        date_closed: orderDetails.date_closed ? parseMLDate(orderDetails.date_closed) : null,
         status: orderDetails.status,
         tags: orderDetails.tags,
         total_amount: orderDetails.total_amount,
@@ -318,10 +315,10 @@ export class NotificationService {
         }
       }
     } else {
-      order.date_approved = this.parseMLDate(orderDetails.date_approved ?? orderDetails.date_created);
-      order.last_updated = this.parseMLDate(orderDetails.last_updated);
-      order.expiration_date = orderDetails.expiration_date ? this.parseMLDate(orderDetails.expiration_date) : null;
-      order.date_closed = orderDetails.date_closed ? this.parseMLDate(orderDetails.date_closed) : null;
+      order.date_approved = parseMLDate(orderDetails.date_approved ?? orderDetails.date_created);
+      order.last_updated = parseMLDate(orderDetails.last_updated);
+      order.expiration_date = orderDetails.expiration_date ? parseMLDate(orderDetails.expiration_date) : null;
+      order.date_closed = orderDetails.date_closed ? parseMLDate(orderDetails.date_closed) : null;
       order.status = orderDetails.status;
       order.total_amount = orderDetails.total_amount;
       order.paid_amount = orderDetails.paid_amount;
@@ -578,7 +575,6 @@ export class NotificationService {
   }
 
   private async savePayments(payments: any[], order: Order): Promise<void> {
-    console.log(`[NotificationService] Payments for order ${order.id}:`, JSON.stringify(payments, null, 2));
 
     const paymentPromises = payments.map(async (paymentDetail: any) => {
       let payment = await this.paymentRepository.findOne({ where: { id: paymentDetail.id } });
@@ -586,7 +582,7 @@ export class NotificationService {
       const transactionAmount = paymentDetail.transaction_amount || 0;
       const ivaAmount = this.extractIva(transactionAmount);
       const finalMarketplaceFee = paymentDetail.marketplace_fee || 0;
-      console.log(`[NotificationService] Order ${order.id}: marketplace_fee=${finalMarketplaceFee}, shipping=${paymentDetail.shipping_cost}`);
+      this.logger.debug(`Order ${order.id}: marketplace_fee=${finalMarketplaceFee}, shipping=${paymentDetail.shipping_cost}`);
 
       if (!payment) {
         payment = this.paymentRepository.create({
@@ -600,7 +596,7 @@ export class NotificationService {
           marketplace_fee: finalMarketplaceFee,
           iva_amount: ivaAmount,
           total_paid_amount: paymentDetail.total_paid_amount,
-          date_approved: this.parseMLDate(paymentDetail.date_approved),
+          date_approved: parseMLDate(paymentDetail.date_approved),
           currency_id: paymentDetail.currency_id,
         });
       } else {
@@ -612,7 +608,7 @@ export class NotificationService {
         payment.marketplace_fee = finalMarketplaceFee;
         payment.iva_amount = ivaAmount;
         payment.total_paid_amount = paymentDetail.total_paid_amount;
-        payment.date_approved = this.parseMLDate(paymentDetail.date_approved);
+        payment.date_approved = parseMLDate(paymentDetail.date_approved);
         payment.currency_id = paymentDetail.currency_id;
       }
 
@@ -649,8 +645,6 @@ export class NotificationService {
   }
 
   private extractMarketplaceFee(billingInfo: any): number {
-    console.log(`[NotificationService] Full billing info:`, JSON.stringify(billingInfo, null, 2));
-
     if (!billingInfo) {
       return 0;
     }
@@ -711,7 +705,6 @@ export class NotificationService {
       }
 
       const accessToken = session.access_token;
-      console.log('Intentando acceder con el token:', accessToken);
 
       const response: AxiosResponse = await firstValueFrom(
         this.httpService.get(`${this.apiUrl}${notification.resource}`, {
@@ -795,7 +788,7 @@ export class NotificationService {
 
   private async refreshAccessToken(refreshToken: string): Promise<any> {
     try {
-      console.log('Realizando solicitud para refrescar el token...' + refreshToken);
+      console.log('Realizando solicitud para refrescar el token...');
       const response = await firstValueFrom(
         this.httpService.post(
           `${this.apiUrl}/oauth/token`,

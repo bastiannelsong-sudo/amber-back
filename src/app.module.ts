@@ -49,15 +49,13 @@ import { MonthlyConfiguration } from './orders/entities/monthly-configuration.en
       }),
       inject: [ConfigService],
     }),
-    TypeOrmModule.forFeature([User, Order, OrderItem, Payment, Notification, Session,ProductAudit,Product]),
     OrderModule,
     AuthModule,
     NotificationModule,
     HttpModule,
     ProductsModule,
     MercadoLibreModule,
-    InventoryModule
-
+    InventoryModule,
   ],
   controllers: [],
   providers: [],

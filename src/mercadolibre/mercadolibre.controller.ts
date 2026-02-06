@@ -51,11 +51,11 @@ export class MercadoLibreController {
     @Param('itemId') itemId: string,
     @Query('seller_id', ParseIntPipe) sellerId: number,
   ) {
-    // Get variations from dedicated endpoint
-    const variations = await this.mercadoLibreService.getItemVariations(itemId, sellerId);
-
-    // Get item with include_attributes=all (may include SELLER_SKU)
-    const itemWithAttrs = await this.mercadoLibreService.getItemWithAttributes(itemId, sellerId);
+    // Get variations and item attributes in parallel
+    const [variations, itemWithAttrs] = await Promise.all([
+      this.mercadoLibreService.getItemVariations(itemId, sellerId),
+      this.mercadoLibreService.getItemWithAttributes(itemId, sellerId),
+    ]);
 
     // Get each variation individually (may include more data)
     const variationDetails = await Promise.all(
@@ -219,21 +219,23 @@ export class MercadoLibreController {
 
     const result = await this.mercadoLibreService.validateStockWithML(localProducts, sellerId);
 
-    // Create a map of ml_item_id -> logistic_type for easy lookup
-    const logisticTypeMap = new Map(
-      secondarySkus.map(sku => [sku.secondary_sku, sku.logistic_type])
+    // Build maps for O(1) lookups instead of O(n) .find() per item
+    const skuMap = new Map(
+      secondarySkus.map(sku => [sku.secondary_sku, sku])
     );
 
     // Enrich results with logistic_type and stock details
-    const enrichItem = (item: any) => ({
-      ...item,
-      logistic_type: logisticTypeMap.get(item.ml_item_id) || 'other',
-      stock: secondarySkus.find(s => s.secondary_sku === item.ml_item_id)?.product.stock || 0,
-      stock_bodega: secondarySkus.find(s => s.secondary_sku === item.ml_item_id)?.product.stock_bodega || 0,
-      // Preserve stock breakdown fields
-      ml_stock_flex: item.ml_stock_flex,
-      ml_stock_full: item.ml_stock_full,
-    });
+    const enrichItem = (item: any) => {
+      const sku = skuMap.get(item.ml_item_id);
+      return {
+        ...item,
+        logistic_type: sku?.logistic_type || 'other',
+        stock: sku?.product.stock || 0,
+        stock_bodega: sku?.product.stock_bodega || 0,
+        ml_stock_flex: item.ml_stock_flex,
+        ml_stock_full: item.ml_stock_full,
+      };
+    };
 
     const enrichedMatching = result.matching.map(enrichItem);
     const enrichedDiscrepancies = result.discrepancies.map(enrichItem);
@@ -622,30 +624,40 @@ export class MercadoLibreController {
       failed: [] as any[],
     };
 
-    for (const sku of secondarySkus) {
-      // Si es fulfillment (ML maneja el inventario), solo enviar stock
-      // Si es flex/otros (tú manejas inventario), enviar stock + stock_bodega
-      const totalStock = sku.logistic_type === 'fulfillment'
-        ? (sku.product.stock || 0)
-        : (sku.product.stock || 0) + (sku.product.stock_bodega || 0);
-      try {
-        await this.mercadoLibreService.updateItemStock(
-          sku.secondary_sku,
-          totalStock,
-          sellerId,
-        );
-        results.success.push({
-          ml_item_id: sku.secondary_sku,
-          internal_sku: sku.product.internal_sku,
-          stock_sent: totalStock,
-        });
-      } catch (error) {
-        results.failed.push({
-          ml_item_id: sku.secondary_sku,
-          internal_sku: sku.product.internal_sku,
-          error: error.message,
-        });
-      }
+    // Process in parallel batches of 5 to avoid rate limiting
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < secondarySkus.length; i += BATCH_SIZE) {
+      const batch = secondarySkus.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (sku) => {
+          const totalStock = sku.logistic_type === 'fulfillment'
+            ? (sku.product.stock || 0)
+            : (sku.product.stock || 0) + (sku.product.stock_bodega || 0);
+          await this.mercadoLibreService.updateItemStock(
+            sku.secondary_sku,
+            totalStock,
+            sellerId,
+          );
+          return { sku, totalStock };
+        }),
+      );
+
+      batchResults.forEach((result, idx) => {
+        const sku = batch[idx];
+        if (result.status === 'fulfilled') {
+          results.success.push({
+            ml_item_id: sku.secondary_sku,
+            internal_sku: sku.product.internal_sku,
+            stock_sent: result.value.totalStock,
+          });
+        } else {
+          results.failed.push({
+            ml_item_id: sku.secondary_sku,
+            internal_sku: sku.product.internal_sku,
+            error: result.reason?.message || 'Unknown error',
+          });
+        }
+      });
     }
 
     return {
@@ -1119,22 +1131,6 @@ export class MercadoLibreController {
           sellerId,
         );
 
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 1: Búsqueda en ML`);
-          console.log(`   SKU buscado: "${product.internal_sku}"`);
-          console.log(`   Resultado de búsqueda:`, searchResult);
-          console.log(`   Items encontrados: ${searchResult?.results?.length || 0}`);
-          if (searchResult?.results?.length > 0) {
-            console.log(`   IDs: ${searchResult.results.join(', ')}`);
-          } else {
-            console.log(`   ❌ NO ENCONTRADO - La búsqueda ML no devolvió items`);
-            console.log(`   Posible causa: SELLER_SKU no configurado en ML`);
-          }
-          console.log(`${'='.repeat(70)}\n`);
-        }
-
         return { product, itemIds: searchResult?.results || [] };
       },
       CONCURRENCY,
@@ -1144,7 +1140,7 @@ export class MercadoLibreController {
     // FIXED: Changed to Map<string, Product[]> to support multiple products per item
     // (e.g., PCR0007, PCR0008, PCR0009 all map to the same ML item)
     const itemToProductMap = new Map<string, Product[]>();
-    const allItemIds: string[] = [];
+    const allItemIdsSet = new Set<string>();
 
     for (const { item: product, result, error } of skuSearchResults) {
       if (error) {
@@ -1161,12 +1157,11 @@ export class MercadoLibreController {
         existingProducts.push(product);
         itemToProductMap.set(itemId, existingProducts);
 
-        if (!allItemIds.includes(itemId)) {
-          allItemIds.push(itemId);
-        }
+        allItemIdsSet.add(itemId);
       }
     }
 
+    const allItemIds = Array.from(allItemIdsSet);
     console.log(`[Full Sync] Step 2: Fetching details for ${allItemIds.length} ML items...`);
 
     // Step 2: Fetch all item details in one batch call (getMultipleItems already batches by 20)
@@ -1263,56 +1258,17 @@ export class MercadoLibreController {
       let matchedVariation: any = null;
 
       if (mlItem.variations && mlItem.variations.length > 0) {
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 3: Procesando Item ${mlItem.id}`);
-          console.log(`   Título ML: "${mlItem.title}"`);
-          console.log(`   Status: ${mlItem.status}`);
-          console.log(`   Logistic Type: ${logisticType}`);
-          console.log(`   Variaciones totales: ${mlItem.variations.length}`);
-          console.log(`${'='.repeat(70)}`);
-        }
-
         // Find the variation that matches this product's SKU
         for (const variation of mlItem.variations) {
           const fullDetails = variationDetailsMap.get(variation.id);
           const varSku = fullDetails ? getSellerSkuFromVariation(fullDetails) : null;
 
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n   📦 Variación ${variation.id}:`);
-            console.log(`      - Detalles obtenidos: ${fullDetails ? '✅ Sí' : '❌ No'}`);
-            console.log(`      - SELLER_SKU: ${varSku ? `"${varSku}"` : '❌ NULL'}`);
-            console.log(`      - Match con "PCR0008": ${varSku?.toUpperCase() === 'PCR0008' ? '✅ SÍ' : '❌ NO'}`);
-            console.log(`      - Stock: ${variation.available_quantity ?? 0}`);
-          }
-
           if (varSku && varSku.toUpperCase() === product.internal_sku.toUpperCase()) {
             matchedVariationId = variation.id;
             matchedVariation = variation;
             stockToUse = variation.available_quantity ?? 0;
-            console.log(`[Full Sync] Matched variation ${variation.id} (${varSku}) to product ${product.internal_sku}`);
-
-            // 🔍 LOG DETALLADO para PCR0008
-            if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-              console.log(`\n   ✅ MATCH ENCONTRADO!`);
-              console.log(`      - Variation ID seleccionada: ${matchedVariationId}`);
-              console.log(`      - Stock a usar: ${stockToUse}`);
-            }
-
             break;
           }
-        }
-
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          if (!matchedVariationId) {
-            console.log(`\n   ❌ NO SE ENCONTRÓ MATCH`);
-            console.log(`   Ninguna variación tiene SELLER_SKU = "PCR0008"`);
-            console.log(`   El secondary_sku NO se creará para este producto.`);
-          }
-          console.log(`${'='.repeat(70)}\n`);
         }
       }
 
@@ -1344,25 +1300,6 @@ export class MercadoLibreController {
             logisticType,
             variationId: matchedVariationId,
           });
-
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n${'='.repeat(70)}`);
-            console.log(`🔍 [PCR0008] Step 4: Actualizando link existente`);
-            console.log(`   Secondary SKU ID: ${existingLink.secondary_sku_id}`);
-            console.log(`   Logistic Type: ${logisticType}`);
-            console.log(`   Variation ID: ${matchedVariationId}`);
-            console.log(`${'='.repeat(70)}\n`);
-          }
-        } else {
-          // 🔍 LOG DETALLADO para PCR0008
-          if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-            console.log(`\n${'='.repeat(70)}`);
-            console.log(`🔍 [PCR0008] Step 4: Link ya existe y está actualizado`);
-            console.log(`   Secondary SKU ID: ${existingLink.secondary_sku_id}`);
-            console.log(`   No requiere cambios`);
-            console.log(`${'='.repeat(70)}\n`);
-          }
         }
       } else {
         linksToCreate.push({
@@ -1374,19 +1311,6 @@ export class MercadoLibreController {
           product: { product_id: product.product_id },
           platform: { platform_id: 1 },
         });
-
-        // 🔍 LOG DETALLADO para PCR0008
-        if (product.internal_sku === 'PCR0008' || product.internal_sku === 'PCR0007') {
-          console.log(`\n${'='.repeat(70)}`);
-          console.log(`🔍 [PCR0008] Step 4: Creando nuevo link`);
-          console.log(`   ML Item ID: ${mlItem.id}`);
-          console.log(`   Variation ID: ${matchedVariationId || 'NULL'}`);
-          console.log(`   Product ID: ${product.product_id}`);
-          console.log(`   Logistic Type: ${logisticType}`);
-          console.log(`   Stock: ${stockToUse}`);
-          console.log(`   ✅ Se agregará a la cola de creación`);
-          console.log(`${'='.repeat(70)}\n`);
-        }
       }
 
       // Queue product update (only once per product)
@@ -1441,11 +1365,15 @@ export class MercadoLibreController {
       await this.secondarySkuRepository.save(linksToCreate);
     }
 
-    for (const update of linksToUpdate) {
-      await this.secondarySkuRepository.update(update.id, {
-        logistic_type: update.logisticType as any,
-        ...(update.variationId !== undefined && { variation_id: update.variationId }),
-      });
+    if (linksToUpdate.length > 0) {
+      await Promise.all(
+        linksToUpdate.map((update) =>
+          this.secondarySkuRepository.update(update.id, {
+            logistic_type: update.logisticType as any,
+            ...(update.variationId !== undefined && { variation_id: update.variationId }),
+          }),
+        ),
+      );
     }
 
     // Update products in batches of 50

@@ -56,3 +56,26 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 nul
 backup/
+
+# AI tools
+.claude/
+.claude*
+CLAUDE.md
+.cursorrules
+.cursorignore
+.cursor/
+.aider*
+.codeium/
+.continue/
+copilot-*
+.codex/
+.devin/
+.bolt/
+.windsurf/
+.windsurfrules
+.tabnine*
+.augment/
+AGENTS.md
+.agents/
+.agent/
+.interface-design/

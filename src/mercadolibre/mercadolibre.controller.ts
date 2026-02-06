@@ -138,8 +138,23 @@ export class MercadoLibreController {
 
       if (lastSnapshot) {
         // Use stored ISO timestamp to avoid timezone conversion issues
-        const cacheTimestamp = lastSnapshot.results_data?._timestamp_iso ||
-          (lastSnapshot.created_at ? lastSnapshot.created_at.toISOString() : new Date().toISOString());
+        // For old snapshots without _timestamp_iso, we need to reconstruct UTC properly
+        let cacheTimestamp: string;
+        if (lastSnapshot.results_data?._timestamp_iso) {
+          cacheTimestamp = lastSnapshot.results_data._timestamp_iso;
+        } else if (lastSnapshot.created_at) {
+          // created_at is a Date object already converted to local timezone by TypeORM
+          // We need to get the original UTC value from the database
+          // The safe approach: query the raw UTC value from database
+          const rawSnapshot = await this.snapshotRepository
+            .createQueryBuilder('snapshot')
+            .select('snapshot.created_at')
+            .where('snapshot.snapshot_id = :id', { id: lastSnapshot.snapshot_id })
+            .getRawOne();
+          cacheTimestamp = new Date(rawSnapshot.snapshot_created_at).toISOString();
+        } else {
+          cacheTimestamp = new Date().toISOString();
+        }
         console.log(`[StockValidation] 📦 Loading from cache (last updated: ${cacheTimestamp})`);
         return {
           summary: {

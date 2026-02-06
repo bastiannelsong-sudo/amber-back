@@ -244,8 +244,8 @@ export class MercadoLibreController {
       execution_time_ms: executionTime,
     });
 
-    await this.snapshotRepository.save(snapshot);
-    console.log(`[StockValidation] ✅ Saved snapshot_id: ${snapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
+    const savedSnapshot = await this.snapshotRepository.save(snapshot);
+    console.log(`[StockValidation] ✅ Saved snapshot_id: ${savedSnapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
 
     return {
       summary: {
@@ -259,7 +259,7 @@ export class MercadoLibreController {
       errors: enrichedErrors,
       metadata: {
         from_cache: false,
-        last_updated: snapshot.created_at,
+        last_updated: savedSnapshot.created_at || new Date(),
         execution_time_ms: executionTime,
       },
     };

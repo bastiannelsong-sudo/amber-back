@@ -246,6 +246,7 @@ export class MercadoLibreController {
 
     const savedSnapshot = await this.snapshotRepository.save(snapshot);
     console.log(`[StockValidation] ✅ Saved snapshot_id: ${savedSnapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
+    console.log(`[StockValidation] 🕐 Sending timestamp: ${savedSnapshot.created_at} (type: ${typeof savedSnapshot.created_at})`);
 
     return {
       summary: {

@@ -246,7 +246,8 @@ export class MercadoLibreController {
     });
 
     const savedSnapshot = await this.snapshotRepository.save(snapshot);
-    const timestamp = savedSnapshot.created_at ? savedSnapshot.created_at.toISOString() : new Date().toISOString();
+    // Use current time instead of snapshot.created_at to avoid timezone conversion issues
+    const timestamp = new Date().toISOString();
     console.log(`[StockValidation] ✅ Saved snapshot_id: ${savedSnapshot.snapshot_id} (${localProducts.length} items, ${(executionTime / 1000).toFixed(1)}s)`);
     console.log(`[StockValidation] 🕐 Sending timestamp: ${timestamp}`);
 

@@ -26,6 +26,7 @@ export class StockValidationSnapshot {
     matching: any[];
     discrepancies: any[];
     errors: any[];
+    _timestamp_iso?: string;
   };
 
   @Column({ type: 'int', nullable: true })

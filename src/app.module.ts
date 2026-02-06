@@ -24,6 +24,10 @@ import { ProductHistory } from './products/entities/product-history.entity';
 import { ProductMapping } from './products/entities/product-mapping.entity';
 import { PendingSale } from './notification/entities/pending-sale.entity';
 import { InventoryModule } from './inventory/inventory.module';
+import { EcommerceModule } from './ecommerce/ecommerce.module';
+import { EcommerceOrder } from './ecommerce/entities/ecommerce-order.entity';
+import { Review } from './ecommerce/entities/review.entity';
+import { Coupon } from './ecommerce/entities/coupon.entity';
 import { MonthlyFlexCost } from './orders/entities/monthly-flex-cost.entity';
 import { FaztConfiguration } from './orders/entities/fazt-configuration.entity';
 import { MonthlyConfiguration } from './orders/entities/monthly-configuration.entity';
@@ -44,7 +48,7 @@ import { MonthlyConfiguration } from './orders/entities/monthly-configuration.en
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_DATABASE'),
-        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost, FaztConfiguration, MonthlyConfiguration, StockValidationSnapshot],
+        entities: [User, Order, OrderItem, Payment, Notification, Session, Product, Platform, SecondarySku, Category, ProductAudit, ProductHistory, ProductMapping, PendingSale, MonthlyFlexCost, FaztConfiguration, MonthlyConfiguration, StockValidationSnapshot, EcommerceOrder, Review, Coupon],
         synchronize: false,
       }),
       inject: [ConfigService],
@@ -56,6 +60,7 @@ import { MonthlyConfiguration } from './orders/entities/monthly-configuration.en
     ProductsModule,
     MercadoLibreModule,
     InventoryModule,
+    EcommerceModule,
   ],
   controllers: [],
   providers: [],
